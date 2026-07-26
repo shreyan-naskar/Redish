@@ -400,14 +400,16 @@ int main() {
   //
   // Index = file descriptor
   // Value = Conn*
-  vector<Conn*> fdToConnection;
+  vector<Conn*> fdToConnection; // record fd belongs to which client
 
-  // poll needs an array describing eery fd we want to monitor
+  // poll needs an array describing every fd we want to monitor
   vector<pollfd> pollArgs;
 
   // EVENT LOOP
+  // build poll list -> poll() sleeps -> Kernel wakes up -> handle ready sockets -> repeat
   while (true) {
     // build poll() arguement list
+    // remove outdated sockets
     pollArgs.clear();
 
     /*
@@ -417,78 +419,88 @@ int main() {
      * meaning a new client wants to connect.
      */
     pollArgs.push_back({
-      listenFd, POLLIN, 0
+      listenFd, // fd
+      POLLIN, // events: listening socket -> only interested in POLLIN
+      0 // revents: filled by kernel
     });
 
     // add every connected client
     for (Conn* connection : fdToConnection) {
+      // indexed by fd value -> not continuous -> many values in b/w are nullptr
       if (!connection) continue;
 
-      pollfd pfd{};
+      // new fd to poll
+      pollfd pfd{}; // init to 0
 
       pfd.fd = connection->fd;
 
-      // watch for socket errors
+      // watch for socket errors: conn reset/ broken pipe/ socket failure
       pfd.events = POLLERR;
 
-      // watch for what application wants
-      if (connection->wantRead) pfd.events |= POLLIN;
-
-      if (connection->wantWrite) pfd.events |= POLLOUT;
+      // watch for what fd wants: flip POLLIN bit
+      if (connection->wantRead) pfd.events |= POLLIN; // error or readable
+      // flip POLLOUT bit
+      if (connection->wantWrite) pfd.events |= POLLOUT; // error or writeable
 
       pollArgs.push_back(pfd);
+
+      // pollArgs looks like
+      /*
+       * +------------------------------------+
+       * | fd=3 | POLLIN              | -> listening socket
+       * +------------------------------------+
+       * | fd=4 | POLLERR | POLLIN    | -> client socket
+       * +------------------------------------+
+       * | fd=7 | POLLERR | POLLOUT   |
+       * +------------------------------------+
+       * 
+       * The key idea is that Conn stores the long-lived state of each client.
+       * while pollArgs is just a snapshot -> 
+       * -> kernel to watch during this one iteration of event loop
+       */
     }
 
     // sleep until something happens
     int readyCount = poll(
       pollArgs.data(),
       pollArgs.size(),
-      -1
+      -1 // TIMEOUT: block until an event occurs
     );
-
+    // system interrupt -> restart
     if (readyCount < 0 && errno == EINTR) continue;
-
+    // poll failed
     if (readyCount < 0) die("poll()");
 
+    // atleast 1 client is waiting for a connection
+    // -> connect front of queue
     // listening socket
-    if (pollArgs[0].revents) {
-      Conn* connection = handleAccept(listenFd);
+    if (pollArgs[0].revents) { // if POLLIN: -> client to connect
+      Conn* connection = handleAccept(listenFd); // create connection object
 
       if (connection) {
         
         // ensure vector is large enough
         if (fdToConnection.size() <= static_cast<size_t>(connection->fd)) {
-
+          // resize to fd value
           fdToConnection.resize(connection->fd + 1);
         }
-
+        // map fd value -> connection object
         fdToConnection[connection->fd] = connection;
       }
     }
 
     // client sockets
     for (size_t i = 1; i < pollArgs.size(); i++) {
-      auto ready = pollArgs[i].revents;
+      auto ready = pollArgs[i].revents; // ready: bitmask -> POLLERR | POLLIN or POLLERR | POLLOUT
 
+      // not ready
       if (ready == 0) continue;
 
       Conn* connection = fdToConnection[pollArgs[i].fd];
 
-      // std::cout << "fd = "
-      //     << pollArgs[i].fd
-      //     << '\n';
+      if (ready & POLLIN) handleRead(connection); // & to check if the POLLIN bit is set
 
-      // std::cout << "vector size = "
-      //     << fdToConnection.size()
-      //     << '\n';
-
-      // std::cout << "pointer = "
-      //     << fdToConnection[pollArgs[i].fd]
-      //     << '\n';
-
-      if (ready & POLLIN) handleRead(connection);
-
-      if (ready & POLLOUT) handleWrite(connection);
+      if (ready & POLLOUT) handleWrite(connection); // & to check if the POLLOUT bit is set
 
       // remove dead connection
       if (
