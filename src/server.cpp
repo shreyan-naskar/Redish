@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <iostream>
 #include <vector>
+#include<map>
 
 #include <fcntl.h>
 #include <poll.h>
@@ -17,7 +18,50 @@
 using namespace std;
 
 constexpr size_t MAX_MSG_SIZE = 32 << 20;
-constexpr size_t READ_BUFFER_SIZE = 64 * 1024;
+constexpr size_t READ_BUFFER_SIZE = 64 * 1024; // temp read buffer size
+constexpr size_t MAX_ARGUMENTS = 200000; // max command args
+
+// placeholder; implemented later
+static map<string, string> database;
+
+enum ResponseStatus {
+  RESPONSE_OK = 0,
+  RESPONSE_ERROR = 1,
+  RESPONSE_NOT_FOUND = 2
+};
+
+struct Conn {
+  // socket file desc for this client
+  int fd = -1;
+  /*
+   * The event loop uses these flags to decide whether to ask poll()
+   * to watch for reading or writing.
+   */
+
+  bool wantRead = false;
+  bool wantWrite = false;
+  bool wantClose = false;
+
+  /*
+   * Bytes received from the client.
+   * The protocol parser reads requests from this buffer.
+   */
+  vector<uint8_t> incoming;
+
+  /*
+   * Bytes waiting to be sent to client
+   */
+  vector<uint8_t> outgoing;
+};
+
+// +--------+---------+
+// | status | data... |
+// +--------+---------+
+struct Response {
+    uint32_t status = RESPONSE_OK;
+    vector<uint8_t> data;
+};
+
 // Print a simple message.
 static void msg(const std::string& message) {
   std::cerr << message << '\n';
@@ -64,30 +108,6 @@ static void setNonBlocking(int fd) {
     die("fcntl(F_SETFL)");
   }
 }
-
-struct Conn {
-  // socket file desc for this client
-  int fd = -1;
-  /*
-   * The event loop uses these flags to decide whether to ask poll()
-   * to watch for reading or writing.
-   */
-
-  bool wantRead = false;
-  bool wantWrite = false;
-  bool wantClose = false;
-
-  /*
-   * Bytes received from the client.
-   * The protocol parser reads requests from this buffer.
-   */
-  vector<uint8_t> incoming;
-
-  /*
-   * Bytes waiting to be sent to client
-   */
-  vector<uint8_t> outgoing;
-};
 
 // BUFFER HELPERS
 
@@ -169,6 +189,163 @@ static Conn* handleAccept(int listenFd) {
   return connection;
 }
 
+/*
+ * Read a 4-byte unsigned integer
+ * from the packet.
+ *
+ * curr is automatically advanced.
+ */
+static bool readUint32_t(
+  // reference to pointer
+  const uint8_t* &current, // Bytes already read
+  const uint8_t* end, // last position 
+  uint32_t& value
+) {
+  // not enough bytes left
+  if ((current + 4) > end) return false;
+
+  memcpy(&value, current, 4);
+  current += 4; // move 4B
+  return true;
+}
+
+/*
+ * Read one string of known length.
+ */
+static bool readString(
+  const uint8_t* &current, // Bytes already read
+  const uint8_t* end, // last position 
+  size_t length, // output bytes to read
+  string& output
+) {
+  if (current + length > end) return false;
+
+  output.assign(
+    reinterpret_cast<const char*>(current),
+    length
+  );
+
+  current += length;
+  return true;
+}
+
+// parse the req body
+// +------+-----+------+-----+------+-----+-----+------+
+// | nstr | len | str1 | len | str2 | ... | len | strn |
+// +------+-----+------+-----+------+-----+-----+------+
+
+static int32_t parseRequest(
+  const uint8_t* data,
+  size_t size,
+  vector<string>& command
+) {
+  const uint8_t* end = data + size;
+
+  // number of strings
+  uint32_t numStrings = 0;
+  if (!readUint32_t(data, end, numStrings)) return -1;
+
+  if (numStrings > MAX_ARGUMENTS) return -1;
+
+  // read every string
+  while (command.size() < numStrings) {
+
+    uint32_t length = 0; // string to read
+
+    if (!readUint32_t(data, end, length)) return -1;
+
+    command.emplace_back();
+
+    if (!readString(data, end, length, command.back())) return -1;
+  }
+
+  // extra bytes?
+  if (data != end) return -1;
+
+  return 0;
+}
+
+static void doRequest(vector<string>& command, Response& response) {
+
+  // GET
+  if (command.size() == 2 && command[0] == "get") {
+    auto it = database.find(command[1]); // search key iterator
+
+    // not found in db
+    if (it == database.end()) {
+      response.status = RESPONSE_NOT_FOUND;
+      return;
+    }
+
+    // set response data
+    response.data.assign(
+      it->second.begin(),
+      it->second.end()
+    );
+
+    return;
+  }
+
+  // SET
+  if (command.size() == 3 && command[0] == "set")
+  {
+    database[command[1]] = command[2];
+
+    return;
+  }
+
+  // DEL
+  if (command.size() == 2 && command[0] == "del")
+  {
+    database.erase(command[1]);
+
+    return;
+  }
+
+  // Unknown command
+  response.status = RESPONSE_ERROR;
+}
+
+// build response packet
+// +----------------------+
+// | Packet Length        |
+// +----------------------+
+// | Status               |
+// +----------------------+
+// | Data                 |
+// +----------------------+
+static void makeResponse(const Response& response, vector<uint8_t>& output) {
+  /*
+   * Packet:
+   *
+   * Length
+   * Status
+   * Data
+   */
+  uint32_t bodyLength = 4 + response.data.size();
+
+  // bodylength field
+  appendBytes(
+    output,
+    reinterpret_cast<uint8_t*>(&bodyLength),
+    4
+  );
+
+  // status code field
+  appendBytes(
+    output,
+    reinterpret_cast<const uint8_t*>(&response.status),
+    4
+  );
+
+  // data field
+  appendBytes(
+    output,
+    response.data.data(),
+    response.data.size()
+  );
+}
+
 // Try to process ONE complete request
 /*
  * The incoming buffer may contain:
@@ -195,45 +372,43 @@ static bool tryOneRequest(Conn* connection) {
   memcpy(&length, connection->incoming.data(), 4); // (dest, src, size)
   if ( length > MAX_MSG_SIZE) {
     msg("message too large");
-    connection->wantClose = true;
+    connection->wantClose = true; // want close
 
     return false;
   }
 
   // check for whole message
   if (connection->incoming.size() < 4 + length) {
-    return false;
+    return false; // want more read
   }
 
   // pointer to req body
   const uint8_t* request = connection->incoming.data() + 4;
 
-  // print client msg
-  std::cout
-    << "Client says: "
-    << string(
-      reinterpret_cast<const char*>(request),
-      std::min(length, static_cast<uint32_t>(100)))
-    << '\n';
+  // application logic starts
+  vector<string> command;
+  if (parseRequest(request, length, command)) {
+    msg("Bad Request");
+    connection->wantClose = true;
 
-  // Build reply: echo the req
-  appendBytes(
-    connection->outgoing,
-    reinterpret_cast<uint8_t*>(&length),
-    4
-  );
+    return false;
+  }
 
-  appendBytes(
-    connection->outgoing,
-    request,
-    length
-  );
+  // build response object
+  Response response;
+
+  // execure request
+  doRequest(command, response);
+
+  // make response 
+  makeResponse(response, connection->outgoing);
+  // application logic ends
 
   // remove process requests
   consumeBytes(
     connection->incoming,
     4 + length
-);
+  );
 
   return true;
 }
@@ -311,7 +486,7 @@ static void handleRead(Conn* connection) {
   ssize_t bytesRead = read(
     connection->fd,
     buffer,
-    READ_BUFFER_SIZE
+    sizeof(buffer)
   );
 
   // Socket isn't ready
@@ -353,7 +528,7 @@ static void handleRead(Conn* connection) {
     // optimization: just received data -> client alive
     //               -> TCP send buffer is probably empty
     handleWrite(connection);
-  }
+  } // else wants read
 }
 
 int main() {
@@ -485,12 +660,13 @@ int main() {
           fdToConnection.resize(connection->fd + 1);
         }
         // map fd value -> connection object
+        assert(!fdToConnection[connection->fd]);
         fdToConnection[connection->fd] = connection;
       }
     }
 
     // client sockets
-    for (size_t i = 1; i < pollArgs.size(); i++) {
+    for (size_t i = 1; i < pollArgs.size(); i++) { // skip listening fd
       auto ready = pollArgs[i].revents; // ready: bitmask -> POLLERR | POLLIN or POLLERR | POLLOUT
 
       // not ready
@@ -512,4 +688,5 @@ int main() {
       }
     }
   }
+  return 0;
 }

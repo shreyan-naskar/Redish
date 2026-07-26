@@ -1,7 +1,7 @@
 #include <cassert>
 #include <cstdint>
-#include <cstring>
 #include <cstdlib>
+#include <cstring>
 #include <cerrno>
 #include <iostream>
 #include <string>
@@ -16,8 +16,8 @@ using namespace std;
 
 // HERE ON BYTE BUFFERS WILL BE USED INSTEAD OF STRING BUFFERS
 
-// Maximum size of a single message (32 MB)
-constexpr size_t MAX_MSG_SIZE = 32 << 20;
+// Maximum size of a single message 4kB
+constexpr size_t MAX_MSG_SIZE = 4096;
 
 // Print a simple message to stderr
 void msg(const string& msg) {
@@ -45,7 +45,7 @@ static void die(const string& msg) {
  * Repeatedly call read() until all bytes have been received.
  */
 
-static int32_t readFull(int fd, uint8_t* buffer, size_t bytesToRead) {
+static int32_t readFull(int fd, char* buffer, size_t bytesToRead) {
   // read all bytes  
   while (bytesToRead > 0) {
       ssize_t bytesRead = read(fd, buffer, bytesToRead);
@@ -75,7 +75,7 @@ static int32_t readFull(int fd, uint8_t* buffer, size_t bytesToRead) {
  * Like read(), write() is also allowed to write only part of the data
  * Keep writing until everything is sent.
  */
-static int32_t writeAll(int fd, const uint8_t* buffer, size_t bytesToWrite) {
+static int32_t writeAll(int fd, const char* buffer, size_t bytesToWrite) {
   // write all bytes
   while (bytesToWrite > 0) {
 
@@ -101,18 +101,6 @@ static int32_t writeAll(int fd, const uint8_t* buffer, size_t bytesToWrite) {
 }
 
 /*
- * Append raw bytes to the end of a vector, works like a growable byte array.
- */
-static void appendBytes(
-  vector<uint8_t>& buffer, // writebuffer
-  const uint8_t* data, // data to insert
-  size_t length // length of data to insert
-) {
-  buffer.insert(buffer.end(), data, data + length);
-
-}
-
-/*
  * Send one request to the server and receive one reply.
  *
  * Packet format:
@@ -120,93 +108,130 @@ static void appendBytes(
  * | 4-byte len | message bytes  |
  * +------------+----------------+
  *
- * First 4 bytes - bytes to read for the message.
+ * First 4 bytes - number of bytes to read for the message.
  */
-static int32_t sendRequest(int fd, const uint8_t* message, size_t length) {
-  
-  if (length > MAX_MSG_SIZE) {
+static int32_t sendRequest(int fd, const vector<string>& command) {
+  /*
+   * Packet format:
+   *
+   * +----------------------+
+   * | Total Length (4B)    |
+   * +----------------------+
+   * | Num Strings (4B)     |
+   * +----------------------+
+   * | Len | String         |
+   * +----------------------+
+   * | Len | String         |
+   * +----------------------+
+   * ...
+   */
+  uint32_t bodyLength = 4; // init with size of total-length field
+
+  for (const auto& word : command) {
+
+    bodyLength += (4 + word.size()); // 4B for string len field + size of string    
+  }
+
+  if (bodyLength > MAX_MSG_SIZE) {
     return -1;
   }
-  vector<uint8_t> writeBuffer;
 
-  /*
-   * Build the packet to send.
-   *
-   * Layout:
-   * +-------------------------
-   * | length |  message... |
-   * +-------------------------
-   */
+  // message buffer
+  char writeBuffer[4 + MAX_MSG_SIZE];
 
-  // 4B data length
-  appendBytes(
-    writeBuffer,
-    reinterpret_cast<const uint8_t*>(&length), // size_t -> const uint8_t*
-    4
-  );
+  // add total length field
+  memcpy(writeBuffer, &bodyLength, 4);
 
-  // data body
-  appendBytes(
-    writeBuffer,
-    message,
-    length
-  );
+  // add nstr field
+  uint32_t nstr = command.size();
+  memcpy(writeBuffer + 4, &nstr, 4);
 
-  return writeAll(
-    fd,
-    writeBuffer.data(),
-    writeBuffer.size()
-  );
+  size_t current = 8; // 4B totalLen + 4B nstr
+  // add the strings
+  for (const auto& word : command) {
+
+    // len field
+    uint32_t wordLen = word.size();
+    memcpy(
+      writeBuffer + current, // start of len for this word
+      &wordLen,
+      4
+    );
+
+    // string field
+    memcpy(
+      writeBuffer + current + 4,
+      word.data(),
+      word.size()
+    );
+
+    current += 4 + word.size();
+    
+  }
+
+  // send request
+  return writeAll(fd, writeBuffer, 4 + bodyLength);
 }
 
+// READ SERVER RESPONSE
 static int32_t readResponse(int fd) {
-  // Read 4B header for length
-  // initialize for just 4B, can't know message length beforehand
-  vector<uint8_t> readBuffer(4);
+  char readBuffer[4 + MAX_MSG_SIZE];
 
+  // read packet length
   errno = 0;
-  
-  // Read reply header (4 bytes)
-  if (readFull(fd, readBuffer.data(), 4)) {
+  if (readFull(fd, readBuffer, 4)) {
     if (errno == 0) msg("EOF");
     else msg("read() error");
-
     return -1;
   }
 
-  // extract response length
-  uint32_t length = 0;
-  memcpy(&length, readBuffer.data(), 4);
-  if (length > MAX_MSG_SIZE) {
-    msg("Message length to large.");
+  // extract body length
+  uint32_t bodyLength = 0;
+  memcpy(&bodyLength, readBuffer, 4);
+  if (bodyLength > MAX_MSG_SIZE) {
+    msg("Message size too large");
+    return -1;
   }
 
-  // extract response body
-  // need extra space to store the message
-  // total space needed = 4 + length -> RESIZE
-  readBuffer.resize(4 + length);
-
-  if (readFull(fd, readBuffer.data() + 4, length)) {
+  // read response body
+  if (readFull(fd, readBuffer + 4, bodyLength)) {
     msg("read() error");
     return -1;
   }
 
-  // print response
-  cout << "Length: " << length << endl;
-  cout << "Response: " << 
-    std::string(
-      // skip the length part, point to the message body
-      reinterpret_cast<char*>(readBuffer.data() + 4),
-      min(length, static_cast<uint32_t>(100)) // print the firt 100 chars just as demo
-    ) << endl;
+  // check for valid response
+  if (bodyLength < 4) {
+    msg("bad response");
+    return -1;
+  }
+
+  // Response format:
+  //
+  // Result Code (4B) - Message
+
+  uint32_t resultCode = 0;
+  memcpy(&resultCode, readBuffer + 4, 4);
+
+  std::cout
+    << "Result Code : "
+    << resultCode
+    << '\n';
+
+  std::cout
+    << "Response    : "
+    << std::string(
+            readBuffer + 8, // skip 4B totalLength + 4B status code
+            bodyLength - 4  // bodyLength - 4B statusCode
+      )
+    << '\n';
 
   return 0;
 }
 
-int main(){
+int main(int argc, char* argv[]){
   // Create TCP socket
-  int socketFd = socket(AF_INET, SOCK_STREAM, 0);
-  if (socketFd < 0){
+  int clientFd = socket(AF_INET, SOCK_STREAM, 0);
+  if (clientFd < 0){
     die("socket");
   }
 
@@ -220,50 +245,28 @@ int main(){
 
   // Connect to server
   if(
-    connect(socketFd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0
+    connect(clientFd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0
   ) {
     die("connect");
   }
 
-  vector<string> requests = {
+  // Build command from command-line arguments
+  std::vector<std::string> command;
 
-    "hello1",
-    "hello2",
-    "hello3",
+  for (int i = 1; i < argc; i++)
+      command.push_back(argv[i]);
 
-    // Large request
-    string(MAX_MSG_SIZE, 'z'),
-
-    "hello5"
-  };
-
-  /*
-   * PIPELINING
-   *
-   * Send ALL requests first...
-   */
-
-  for (const auto& req : requests) {
-    if (sendRequest(
-      socketFd,
-      reinterpret_cast<const uint8_t*>(req.data()),
-      req.size()
-    )) {
+  // Send request
+  if (sendRequest(clientFd, command))
       goto DONE;
-    }
-  }
 
-  /*
-   * ...then read ALL responses.
-   */
-  for (size_t i = 0; i < requests.size(); i++) {
-
-    if (readResponse(socketFd))
-        goto DONE;
-  }
-
+  // Read reply
+  if (readResponse(clientFd))
+      goto DONE;
+  
   DONE:
 
-  close(socketFd);
+  close(clientFd);
+
   return 0;
 }
