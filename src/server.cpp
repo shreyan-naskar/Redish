@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
+#include <cstddef>
 #include <iostream>
 #include <vector>
 #include<map>
@@ -15,6 +16,8 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
+#include "hashtable.h"
+
 using namespace std;
 
 constexpr size_t MAX_MSG_SIZE = 32 << 20;
@@ -22,7 +25,9 @@ constexpr size_t READ_BUFFER_SIZE = 64 * 1024; // temp read buffer size
 constexpr size_t MAX_ARGUMENTS = 200000; // max command args
 
 // placeholder; implemented later
-static map<string, string> database;
+static struct {
+    HMap db;
+} g_data;
 
 enum ResponseStatus {
   RESPONSE_OK = 0,
@@ -61,6 +66,22 @@ struct Response {
     uint32_t status = RESPONSE_OK;
     vector<uint8_t> data;
 };
+
+// One key-value pair stored in the hash table.
+//
+// HNode is embedded so the hash table can link entries
+// directly without allocating a separate node.
+struct Entry {
+    HNode node;          // Hash table metadata
+    string key;     // Key
+    string val;     // Value
+};
+
+#include <cstddef>
+
+#define container_of(ptr, type, member) \
+    reinterpret_cast<type*>( \
+        reinterpret_cast<char*>(ptr) - offsetof(type, member))
 
 // Print a simple message.
 static void msg(const std::string& message) {
@@ -265,47 +286,148 @@ static int32_t parseRequest(
   return 0;
 }
 
-static void doRequest(vector<string>& command, Response& response) {
+// Equality function used by the hash table.
+//
+// The hash table only sees HNode*, so convert them back
+// to Entry* and compare the actual keys.
+static bool entry_eq(HNode *lhs, HNode *rhs) {
+    Entry *le = container_of(lhs, Entry, node);
+    Entry *re = container_of(rhs, Entry, node);
 
-  // GET
-  if (command.size() == 2 && command[0] == "get") {
-    auto it = database.find(command[1]); // search key iterator
-
-    // not found in db
-    if (it == database.end()) {
-      response.status = RESPONSE_NOT_FOUND;
-      return;
-    }
-
-    // set response data
-    response.data.assign(
-      it->second.begin(),
-      it->second.end()
-    );
-
-    return;
-  }
-
-  // SET
-  if (command.size() == 3 && command[0] == "set")
-  {
-    database[command[1]] = command[2];
-
-    return;
-  }
-
-  // DEL
-  if (command.size() == 2 && command[0] == "del")
-  {
-    database.erase(command[1]);
-
-    return;
-  }
-
-  // Unknown command
-  response.status = RESPONSE_ERROR;
+    return le->key == re->key;
 }
 
+// FNV-1a style hash function.
+// Converts a string into a 64-bit hash code used to
+// choose the bucket.
+static uint64_t str_hash(const uint8_t *data, size_t len) {
+    uint32_t h = 0x811C9DC5;
+
+    for (size_t i = 0; i < len; i++) {
+        h = (h + data[i]) * 0x01000193;
+    }
+
+    return h;
+}
+
+// GET command
+// Search for the key and return its value.
+static void do_get(vector<string> &cmd, Response &out) {
+  // temporary enntronly for lookup
+  Entry key;
+
+  key.key.swap(cmd[1]);
+
+  // compute hash of the key
+  key.node.hcode = str_hash(
+    (uint8_t*)key.key.data(),
+    key.key.size()
+  );
+
+  // search hash table
+  HNode *node = hm_lookup(
+    &g_data.db,
+    &key.node,
+    &entry_eq
+  );
+
+  if (!node) {
+    out.status = RESPONSE_NOT_FOUND;
+    return;
+  }
+
+  // convert HNode* back to Entry*
+  const string &val = container_of(node, Entry, node)->val;
+
+  assert(val.size() <= MAX_MSG_SIZE);
+
+  out.data.assign(val.begin(), val.end());
+
+}
+
+// SET command
+// Update existing key or insert a new one.
+static void do_set(vector<string> &cmd, Response &)
+{
+    Entry key;
+
+    key.key.swap(cmd[1]);
+
+    key.node.hcode = str_hash(
+      (uint8_t*)key.key.data(),
+      key.key.size()
+    );
+
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+
+    if (node) {
+
+      // Existing key → replace value.
+      container_of(node, Entry, node)
+          ->val.swap(cmd[2]);
+
+    } else {
+
+      // New key → allocate a new Entry.
+      Entry *ent = new Entry();
+
+      ent->key.swap(key.key);
+      ent->node.hcode = key.node.hcode;
+      ent->val.swap(cmd[2]);
+
+      hm_insert(&g_data.db, &ent->node);
+  }
+}
+
+// DEL command
+// Remove key from hash table and free memory.
+
+static void do_del(vector<string> &cmd, Response &)
+{
+    Entry key;
+
+    key.key.swap(cmd[1]);
+
+    key.node.hcode = str_hash(
+      (uint8_t*)key.key.data(),
+      key.key.size()
+    );
+
+    HNode *node = hm_delete(&g_data.db, &key.node, &entry_eq);
+
+    if (node) {
+
+      // Recover Entry* from HNode*
+      // and delete it.
+      delete container_of(node, Entry, node);
+    }
+}
+
+// Execute one client command.
+// Supports: GET, SET and DEL.
+static void do_request(std::vector<std::string> &cmd,
+                       Response &out)
+{
+    // GET <key>
+    if (cmd.size() == 2 && cmd[0] == "get") {
+        do_get(cmd, out);
+    }
+
+    // SET <key> <value>
+    else if (cmd.size() == 3 && cmd[0] == "set") {
+        do_set(cmd, out);
+    }
+
+    // DEL <key>
+    else if (cmd.size() == 2 && cmd[0] == "del") {
+        do_del(cmd, out);
+    }
+
+    // Unknown command
+    else {
+        out.status = RESPONSE_ERROR;
+    }
+}
 // build response packet
 // +----------------------+
 // | Packet Length        |
@@ -398,7 +520,7 @@ static bool tryOneRequest(Conn* connection) {
   Response response;
 
   // execure request
-  doRequest(command, response);
+  do_request(command, response);
 
   // make response 
   makeResponse(response, connection->outgoing);
