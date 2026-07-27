@@ -313,9 +313,10 @@ static uint64_t str_hash(const uint8_t *data, size_t len) {
 // GET command
 // Search for the key and return its value.
 static void do_get(vector<string> &cmd, Response &out) {
-  // temporary enntronly for lookup
+  // temporary entry only for lookup
   Entry key;
 
+  // copy query key - O(1)
   key.key.swap(cmd[1]);
 
   // compute hash of the key
@@ -336,7 +337,7 @@ static void do_get(vector<string> &cmd, Response &out) {
     return;
   }
 
-  // convert HNode* back to Entry*
+  // convert HNode* back to Entry* for the value
   const string &val = container_of(node, Entry, node)->val;
 
   assert(val.size() <= MAX_MSG_SIZE);
@@ -347,17 +348,20 @@ static void do_get(vector<string> &cmd, Response &out) {
 
 // SET command
 // Update existing key or insert a new one.
-static void do_set(vector<string> &cmd, Response &)
-{
+static void do_set(vector<string> &cmd, Response &) {   
+    // temporary entry only for lookup
     Entry key;
 
+    // O(1) key swap
     key.key.swap(cmd[1]);
 
+    // compute hash
     key.node.hcode = str_hash(
       (uint8_t*)key.key.data(),
       key.key.size()
     );
-
+    
+    // find corresponding
     HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
 
     if (node) {
@@ -375,6 +379,7 @@ static void do_set(vector<string> &cmd, Response &)
       ent->node.hcode = key.node.hcode;
       ent->val.swap(cmd[2]);
 
+      // insert into hmap
       hm_insert(&g_data.db, &ent->node);
   }
 }
@@ -382,20 +387,24 @@ static void do_set(vector<string> &cmd, Response &)
 // DEL command
 // Remove key from hash table and free memory.
 
-static void do_del(vector<string> &cmd, Response &)
-{
+static void do_del(vector<string> &cmd, Response &) {
+    // temporary entry only for lookup
     Entry key;
 
+    // O(1) key swap
     key.key.swap(cmd[1]);
 
+    // compute hash
     key.node.hcode = str_hash(
       (uint8_t*)key.key.data(),
       key.key.size()
     );
 
+    // delete node
     HNode *node = hm_delete(&g_data.db, &key.node, &entry_eq);
 
-    if (node) {
+    // found
+    if (node) { 
 
       // Recover Entry* from HNode*
       // and delete it.
@@ -519,7 +528,7 @@ static bool tryOneRequest(Conn* connection) {
   // build response object
   Response response;
 
-  // execure request
+  // execute request
   do_request(command, response);
 
   // make response 
