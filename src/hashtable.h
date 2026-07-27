@@ -55,3 +55,6 @@ void hm_clear(HMap *hmap);
 // Return total number of nodes
 // in the hash map.
 size_t hm_size(HMap *hmap);
+
+// invoke the callback on each node until it returns false
+void   hm_foreach(HMap *hmap, bool (*f)(HNode *, void *), void *arg);

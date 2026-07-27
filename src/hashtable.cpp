@@ -203,3 +203,38 @@ size_t hm_size(HMap *hmap)
     return hmap->newer.size +
            hmap->older.size;
 }
+
+// Traverse one hash table.
+//
+// Calls function 'f' for every node.
+// Stops immediately if 'f' returns false.
+static bool h_foreach(HTab *htab, bool (*f)(HNode *, void *), void *arg) {
+
+  // Visit every bucket.
+  for (size_t i = 0; htab->mask != 0 && i <= htab->mask; i++) {
+
+    // Traverse the linked list in this bucket.
+    for (HNode *node = htab->tab[i]; node != nullptr; node = node->next) {
+      
+      // Apply callback to the current node.
+      // Stop traversal if callback returns false.
+      if (!f(node, arg))
+          return false;
+    }
+  }
+
+  return true;
+}
+
+// Traverse the entire hash map.
+//
+// During rehashing, nodes may exist in both
+// newer and older tables, so visit both.
+void hm_foreach(
+    HMap *hmap,
+    bool (*f)(HNode *, void *),
+    void *arg)
+{
+    h_foreach(&hmap->newer, f, arg) &&
+    h_foreach(&hmap->older, f, arg);
+}

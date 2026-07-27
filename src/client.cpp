@@ -16,6 +16,15 @@ using namespace std;
 
 // HERE ON BYTE BUFFERS WILL BE USED INSTEAD OF STRING BUFFERS
 
+enum {
+    TAG_NIL = 0,    // nil
+    TAG_ERR = 1,    // error code + msg
+    TAG_STR = 2,    // string
+    TAG_INT = 3,    // int64
+    TAG_DBL = 4,    // double
+    TAG_ARR = 5,    // array
+};
+
 // Maximum size of a single message 4kB
 constexpr size_t MAX_MSG_SIZE = 4096;
 
@@ -173,6 +182,221 @@ static int32_t sendRequest(int fd, const vector<string>& command) {
   return writeAll(fd, writeBuffer, 4 + bodyLength);
 }
 
+// Parse and print one serialized response.
+//
+// Returns:
+//   > 0 : Number of bytes consumed.
+//   -1  : Invalid response.
+//
+// Response format:
+//
+// +---------+---------------------------+
+// | 1B Tag  | Payload (depends on tag)  |
+// +---------+---------------------------+
+//
+// Tags:
+//   NIL  -> no payload
+//   ERR  -> error code + string
+//   STR  -> string
+//   INT  -> 64-bit integer
+//   DBL  -> double
+//   ARR  -> array of serialized objects
+static int32_t printResponse(const uint8_t *data, size_t size) {
+  // every res must contain atleast tag
+  if (size < 1) {
+    msg("bad response");
+    return -1;
+  }
+  switch (data[0]) {
+    // NIL
+    //
+    // Format:
+    // +------+ 
+    // | TAG  |
+    // +------+
+    case TAG_NIL:
+      printf("(nil)\n");
+      return 1;
+
+    // ERROR
+    //
+    // Format:
+    // +------+-----------+------------+----------------------+
+    // | TAG  | Code      | Str Length | Message              |
+    // | 1B   | 4B (404)  | 4B (9)     | N bytes "Not Found"  |
+    // +------+-----------+------------+----------------------+
+    case TAG_ERR: {
+
+      if (size < 9) {
+        msg("Bad response");
+        return -1;
+      }
+
+      // read error code
+      int32_t code = 0;
+      memcpy(&code, &data[1], 4);
+
+      // read msg length
+      uint32_t msgLen = 0;
+      memcpy(&msgLen, &data[5], 4);
+
+      // ensure complete message exists.
+      if (size < 9 + msgLen) {
+        msg("bad response");
+        return -1;
+      }
+
+      // print respnse
+      // TAG_ERR
+      cout << "(err): " << code << ' ';
+      cout.write(reinterpret_cast<const char*>(data + 9), msgLen);
+      cout << '\n';
+
+      // Bytes consumed:
+      // tag + code + length + string.
+      return 9 + msgLen;
+    }
+
+    // STRING
+    //
+    // Format:
+    //
+    // +------+-----------+-----------+
+    // | TAG  | Length(4B)| Characters|
+    // +------+-----------+-----------+
+    //
+    // Example:
+    //
+    // TAG_STR
+    // len = 5
+    // data = "hello"
+    case TAG_STR: {
+      // need atleasat tag + length
+      if (size < 5) {
+        msg("bad response");
+        return -1;
+      }
+
+      uint32_t msgLen = 0;
+      memcpy(&msgLen, &data[1], 4);
+
+      if (size < 5 + msgLen) {
+        msg("Bad Response");
+        return -1;
+      }
+
+      // print string
+      cout << "(str): ";
+      cout.write(reinterpret_cast<const char*>(data + 5), msgLen);
+      cout << '\n';
+
+      // bytes consumed
+      return 5 + msgLen;
+    }
+    // INTEGER
+    //
+    // Format:
+    //
+    // +------+-------------+
+    // | TAG  | int64_t(8B) |
+    // +------+-------------+
+    case TAG_INT : {
+    // need atleasat tag + 8B integer
+      if (size < 9) {
+        msg("bad response");
+        return -1;
+      }
+
+      uint64_t value = 0;
+      memcpy(&value, &data[1], 8);
+
+      // print string
+      cout << "(int): " << (long long)value << endl;
+
+      // bytes consumed
+      return 9;
+    }
+    // DOUBLE
+    //
+    // Format:
+    //
+    // +------+------------+
+    // | TAG  | double(8B) |
+    // +------+------------+
+    case TAG_DBL : {
+    // need atleasat tag + *B integer
+      if (size < 9) {
+        msg("bad response");
+        return -1;
+      }
+
+      double value = 0;
+      memcpy(&value, &data[1], 8);
+
+      // print string
+      cout << "(int): " << value << endl;
+
+      // bytes consumed
+      return 9;
+    }
+    // ARRAY
+    //
+    // Format:
+    //
+    // +------+-----------+-----------------------------+
+    // | TAG  | Count(4B) | Serialized element 1        |
+    // |      |           | Serialized element 2        |
+    // |      |           | ...                         |
+    // +------+-----------+-----------------------------+
+    //
+    // Each element is itself a complete serialized
+    // response (string/int/error/array/etc.).
+    //
+    // Therefore we recursively call print_response().
+    case TAG_ARR: {
+      // need tag + element count(4B)
+      if (size < 5) {
+        msg("Bad response");
+        return -1;
+      }
+
+      // read element count
+      uint32_t arrLen = 0;
+      memcpy(&arrLen, &data[1], 4);
+
+      cout << "(arr): " << arrLen << endl;
+
+      size_t bytesConsumed = 5; // 1B (code) + 4B (array length)
+      // parse every array length
+      for (uint32_t i = 0; i < arrLen; i++) {
+
+        // parse one serialized object at current position
+        int32_t consumed = printResponse(
+          &data[bytesConsumed],
+          size - bytesConsumed
+        );
+        // Child parser failed.
+        if (consumed < 0)
+            return -1;
+
+        // Move to the next serialized object.
+        bytesConsumed += consumed;
+      }
+
+      cout <<"(arr): end" << endl;
+
+      // Return total bytes consumed by
+      // the entire array.
+      return (int32_t)bytesConsumed;
+    }
+    // Unknown tag
+    default:
+        msg("bad response");
+        return -1;
+        
+  } // switch-case ends
+}
+
 // READ SERVER RESPONSE
 static int32_t readResponse(int fd) {
   char readBuffer[4 + MAX_MSG_SIZE];
@@ -199,33 +423,19 @@ static int32_t readResponse(int fd) {
     return -1;
   }
 
-  // check for valid response
-  if (bodyLength < 4) {
-    msg("bad response");
-    return -1;
+  // Parse and print the response.
+  int32_t parsedLength = printResponse(
+      reinterpret_cast<uint8_t*>(readBuffer + 4),
+      bodyLength
+  );
+
+  // Ensure the parser consumed the entire response.
+  if (parsedLength > 0 && static_cast<uint32_t>(parsedLength) != bodyLength) {
+      msg("bad response");
+      return -1;
   }
 
-  // Response format:
-  //
-  // Result Code (4B) - Message
-
-  uint32_t resultCode = 0;
-  memcpy(&resultCode, readBuffer + 4, 4);
-
-  std::cout
-    << "Result Code : "
-    << resultCode
-    << '\n';
-
-  std::cout
-    << "Response    : "
-    << std::string(
-            readBuffer + 8, // skip 4B totalLength + 4B status code
-            bodyLength - 4  // bodyLength - 4B statusCode
-      )
-    << '\n';
-
-  return 0;
+  return parsedLength;
 }
 
 int main(int argc, char* argv[]){

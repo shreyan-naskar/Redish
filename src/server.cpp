@@ -29,10 +29,28 @@ static struct {
     HMap db;
 } g_data;
 
+using Buffer = vector<uint8_t>;
+
 enum ResponseStatus {
   RESPONSE_OK = 0,
   RESPONSE_ERROR = 1,
   RESPONSE_NOT_FOUND = 2
+};
+
+// error code for TAG_ERR
+enum ErrorCodes {
+    ERR_UNKNOWN = 1,    // unknown command
+    ERR_TOO_BIG = 2,    // response too big
+};
+
+// data types of serialized data
+enum ResponseDataTypes{
+    TAG_NIL = 0,    // nil
+    TAG_ERR = 1,    // error code + msg
+    TAG_STR = 2,    // string
+    TAG_INT = 3,    // int64
+    TAG_DBL = 4,    // double
+    TAG_ARR = 5,    // array
 };
 
 struct Conn {
@@ -51,12 +69,12 @@ struct Conn {
    * Bytes received from the client.
    * The protocol parser reads requests from this buffer.
    */
-  vector<uint8_t> incoming;
+  Buffer incoming;
 
   /*
    * Bytes waiting to be sent to client
    */
-  vector<uint8_t> outgoing;
+  Buffer outgoing;
 };
 
 // +--------+---------+
@@ -134,7 +152,7 @@ static void setNonBlocking(int fd) {
 
 // Append bytes to end of buffer
 static void appendBytes(
-  vector<uint8_t>& buffer,
+  Buffer& buffer,
   const uint8_t* data,
   size_t length
 ) {
@@ -157,11 +175,66 @@ static void appendBytes(
  * +----------------+
  */
 static void consumeBytes(
-  vector<uint8_t>& buffer,
+  Buffer& buffer,
   size_t length
 ) {
   buffer.erase(buffer.begin(), buffer.begin() + length);
 }
+
+// help functions for the serialization
+
+// append TAGs
+static void appendBytes_u8(Buffer &buf, uint8_t data) {
+  buf.push_back(data);
+}
+// append integer: message length or array length
+static void appendBytes_u32(Buffer &buf, uint32_t data) {
+  appendBytes(buf, (const uint8_t *)&data, 4);
+}
+// append integer: data
+static void appendBytes_i64(Buffer &buf, int64_t data) {
+  appendBytes(buf, (const uint8_t *)&data, 8);
+}
+// append double: data
+static void appendBytes_dbl(Buffer &buf, double data) {
+  appendBytes(buf, (const uint8_t *)&data, 8);
+}
+
+// append serialized data types to the back
+
+// no response body
+static void out_nil(Buffer &out) {
+    appendBytes_u8(out, TAG_NIL);
+}
+// string response
+static void out_str(Buffer &out, const char *s, size_t size) {
+    appendBytes_u8(out, TAG_STR); // data type field
+    appendBytes_u32(out, (uint32_t)size); // length of string field
+    appendBytes(out, (const uint8_t *)s, size); // response string
+}
+// integer response
+static void out_int(Buffer &out, int64_t val) {
+    appendBytes_u8(out, TAG_INT); // data type field
+    appendBytes_i64(out, val); // response integer
+}
+// double response
+static void out_dbl(Buffer &out, double val) {
+    appendBytes_u8(out, TAG_DBL); // data type field
+    appendBytes_dbl(out, val); // response double
+}
+// error reponse
+static void out_err(Buffer &out, uint32_t code, const std::string &msg) {
+    appendBytes_u8(out, TAG_ERR); // data type field
+    appendBytes_u32(out, code); // error code field
+    appendBytes_u32(out, (uint32_t)msg.size()); // msg size field
+    appendBytes(out, (const uint8_t *)msg.data(), msg.size()); // error message, eg. "Not Found"
+}
+// array response
+static void out_arr(Buffer &out, uint32_t n) {
+    appendBytes_u8(out, TAG_ARR); // data type field
+    appendBytes_u32(out, n); // response array
+}
+
 
 // Accept a new client connection
 /*
@@ -312,7 +385,7 @@ static uint64_t str_hash(const uint8_t *data, size_t len) {
 
 // GET command
 // Search for the key and return its value.
-static void do_get(vector<string> &cmd, Response &out) {
+static void do_get(vector<string> &cmd, Buffer &out) {
   // temporary entry only for lookup
   Entry key;
 
@@ -333,22 +406,19 @@ static void do_get(vector<string> &cmd, Response &out) {
   );
 
   if (!node) {
-    out.status = RESPONSE_NOT_FOUND;
-    return;
+    return out_nil(out);
   }
 
   // convert HNode* back to Entry* for the value
   const string &val = container_of(node, Entry, node)->val;
 
-  assert(val.size() <= MAX_MSG_SIZE);
-
-  out.data.assign(val.begin(), val.end());
+  return out_str(out, val.data(), val.size());
 
 }
 
 // SET command
 // Update existing key or insert a new one.
-static void do_set(vector<string> &cmd, Response &) {   
+static void do_set(vector<string> &cmd, Buffer &out) {   
     // temporary entry only for lookup
     Entry key;
 
@@ -382,12 +452,13 @@ static void do_set(vector<string> &cmd, Response &) {
       // insert into hmap
       hm_insert(&g_data.db, &ent->node);
   }
+  return out_nil(out);
 }
 
 // DEL command
 // Remove key from hash table and free memory.
 
-static void do_del(vector<string> &cmd, Response &) {
+static void do_del(vector<string> &cmd, Buffer &out) {
     // temporary entry only for lookup
     Entry key;
 
@@ -410,71 +481,130 @@ static void do_del(vector<string> &cmd, Response &) {
       // and delete it.
       delete container_of(node, Entry, node);
     }
+    // return 1 if node deleted
+    return out_int(out, node ? 1 : 0);
+}
+
+
+// Callback called once for every entry in the hash map.
+//
+// `hm_foreach()` accepts a generic void* argument, so `arg` is cast back
+// to the Buffer that receives the serialized response.
+static bool cb_keys(HNode* node, void* arg) {
+    // Recover the output buffer passed from do_keys().
+    Buffer& out = *static_cast<Buffer*>(arg);
+
+    // `node` is embedded inside an Entry. Get its containing Entry object,
+    // then obtain that entry's key.
+    const string& key = container_of(node, Entry, node)->key;
+
+    // Append this key as one serialized string element:
+    // [TAG_STR][key length][key bytes]
+    out_str(out, key.data(), key.size());
+
+    // Return true to tell hm_foreach() to continue visiting entries.
+    return true;
+}
+
+// Implements the `keys` command.
+static void do_keys(std::vector<std::string>&, Buffer& out) {
+    // Start a serialized array:
+    // [TAG_ARR][number of elements]
+    //
+    // The number of keys equals the current number of database entries.
+    out_arr(out, static_cast<uint32_t>(hm_size(&g_data.db)));
+
+    // Visit every database entry. For each one, cb_keys() appends its key
+    // as the next element in the array.
+    hm_foreach(&g_data.db, cb_keys, &out);
 }
 
 // Execute one client command.
 // Supports: GET, SET and DEL.
-static void do_request(std::vector<std::string> &cmd,
-                       Response &out)
+static void do_request(std::vector<std::string> &cmd, Buffer &out)
 {
     // GET <key>
     if (cmd.size() == 2 && cmd[0] == "get") {
-        do_get(cmd, out);
+      return do_get(cmd, out);
     }
 
     // SET <key> <value>
     else if (cmd.size() == 3 && cmd[0] == "set") {
-        do_set(cmd, out);
+      return do_set(cmd, out);
     }
 
     // DEL <key>
     else if (cmd.size() == 2 && cmd[0] == "del") {
-        do_del(cmd, out);
+      return do_del(cmd, out);
     }
 
+    // KEYS
+    else if (cmd.size() == 1 && cmd[0] == "keys") {
+      return do_keys(cmd, out);
+    }
     // Unknown command
     else {
-        out.status = RESPONSE_ERROR;
+      out_err(out, ERR_UNKNOWN, "unknown command");
     }
 }
-// build response packet
-// +----------------------+
-// | Packet Length        |
-// +----------------------+
-// | Status               |
-// +----------------------+
-// | Data                 |
-// +----------------------+
-static void makeResponse(const Response& response, vector<uint8_t>& output) {
-  /*
-   * Packet:
-   *
-   * Length
-   * Status
-   * Data
-   */
-  uint32_t bodyLength = 4 + response.data.size();
 
-  // bodylength field
-  appendBytes(
-    output,
-    reinterpret_cast<uint8_t*>(&bodyLength),
-    4
-  );
+// Returns the size of this response's body, excluding its 4-byte length header.
+//
+// `header` is the index where response_begin() reserved the length field:
+//
+//   header
+//     ↓
+//   [ length: 4 bytes ][ response body ... ]
+//
+// So:
+//   out.size() - header     = header + body total size
+//   out.size() - header - 4 = body size only
+static size_t response_size(Buffer &out, size_t header) {
+    return out.size() - header - 4;
+}
 
-  // status code field
-  appendBytes(
-    output,
-    reinterpret_cast<const uint8_t*>(&response.status),
-    4
-  );
+// Starts one framed response message in `out`.
+//
+// Wire format: [4-byte body length][serialized response body...]
+//
+// Unknown body length yet
+// `do_request()` will append the serialized response afterward
+// Reserve four bytes now and fill them in later in response_end().
+void response_begin(Buffer &out, size_t &header) {
+  // Save where this response starts. `out` may already contain earlier
+  // responses when the client sends pipelined requests.
+  header = out.size();
 
-  // data field
-  appendBytes(
-    output,
-    response.data.data(),
-    response.data.size()
-  );
+  // Reserve the first 4 bytes for the uint32_t message-body length.
+  // They are temporarily zero and will be overwritten in response_end().
+  appendBytes_u32(out, 0);
+}
+
+// Completes the response that began at `header`.
+void response_end(Buffer &out, size_t header) {
+  // `header` points to the 4-byte length field.
+  // Everything after it is the serialized response body.
+  size_t body_size = out.size() - header - 4;
+
+  // Do not send a response larger than the protocol's maximum.
+  if (body_size > MAX_MSG_SIZE) {
+    // Discard the oversized body, but keep its reserved 4-byte header.
+    out.resize(header + 4);
+
+    // Write a normal serialized error body in its place.
+    out_err(out, ERR_TOO_BIG, "response is too big.");
+
+    // Recalculate because the body is now the error response.
+    body_size = out.size() - header - 4;
+  }
+
+  // The protocol stores the body size in the 4 bytes at `header`.
+  // This cast is safe because body_size is checked against k_max_msg.
+  uint32_t length = static_cast<uint32_t>(body_size);
+
+  // Backfill the previously reserved length field.
+  std::memcpy(out.data() + header, &length, sizeof(length));
+  
 }
 
 // Try to process ONE complete request
@@ -525,14 +655,15 @@ static bool tryOneRequest(Conn* connection) {
     return false;
   }
 
-  // build response object
-  Response response;
+  // build response packet
+  size_t header_pos = 0;
+  response_begin(connection->outgoing, header_pos);
 
   // execute request
-  do_request(command, response);
+  do_request(command, connection->outgoing);
 
-  // make response 
-  makeResponse(response, connection->outgoing);
+  response_end(connection->outgoing, header_pos);
+
   // application logic ends
 
   // remove process requests
