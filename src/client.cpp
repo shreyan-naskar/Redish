@@ -364,7 +364,7 @@ static int32_t printResponse(const uint8_t *data, size_t size) {
       uint32_t arrLen = 0;
       memcpy(&arrLen, &data[1], 4);
 
-      cout << "(arr): " << arrLen << endl;
+      cout << "(arr): len = " << arrLen << endl;
 
       size_t bytesConsumed = 5; // 1B (code) + 4B (array length)
       // parse every array length

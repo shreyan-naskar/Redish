@@ -277,3 +277,55 @@ AVLNode* avl_del(AVLNode *node) {
 
   return root;
 }
+
+// Returns the node `offset` positions away from `node` in sorted order.
+//
+// offset > 0: move toward succeeding (larger) nodes.
+// offset < 0: move toward preceding (smaller) nodes.
+// offset == 0: return the original node.
+//
+// Returns nullptr when the requested offset is outside the tree.
+//
+// `cnt` lets the function skip whole subtrees, so traversal is O(log N).
+AVLNode* avl_offset(AVLNode *node, int64_t offset){
+  // current node's rank relativev to the starting node
+  // starting node has relative position 0
+  int64_t pos = 0;
+
+  while (offset != pos) {
+    // moving forward see whether the target lies in the right subtree
+    if (pos < offset && pos + avl_cnt(node->right) >= offset) {
+      // move right, every node in node's left subtree, and node itself
+      // comes before the new current node
+      node = node->right;
+      pos += avl_cnt(node->left) + 1;
+    }
+
+    // move backward: see whether the target lies in left subtree
+    else if (pos > offset && pos - avl_cnt(node->left) <= offset) {
+      // move left, every node in node's right subtree, and node itself
+      // comes after the new current node
+      node = node->left;
+      pos -= avl_cnt(node->right) + 1;
+    }
+
+    else {
+      AVLNode *parent = node->parent;
+
+      // we moved past the tree's root: req pos is absent
+      if (!parent) return nullptr;
+
+      // update pos to represent the parent's rank relative to the starting node
+      if (parent->right == node) {
+        pos -= avl_cnt(node->left) + 1;
+      }
+      else {
+        // current node was in the parent's left subtree
+        pos += avl_cnt(node->right) + 1;
+      }
+
+      node = parent;
+    }
+  }
+  return node;
+}

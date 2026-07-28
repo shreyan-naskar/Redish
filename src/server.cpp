@@ -4,6 +4,7 @@
 #include <cstring>
 #include <cerrno>
 #include <cstddef>
+#include<cmath>
 #include <iostream>
 #include <vector>
 #include<map>
@@ -17,19 +18,30 @@
 #include <sys/socket.h>
 
 #include "hashtable.h"
+#include "zset.h"
+#include "common.h"
 
 using namespace std;
+
+// -----------------------------------------
+// CONSTANTS
+// -----------------------------------------
 
 constexpr size_t MAX_MSG_SIZE = 32 << 20;
 constexpr size_t READ_BUFFER_SIZE = 64 * 1024; // temp read buffer size
 constexpr size_t MAX_ARGUMENTS = 200000; // max command args
 
-// placeholder; implemented later
-static struct {
-    HMap db;
-} g_data;
-
 using Buffer = vector<uint8_t>;
+
+// Shared immutable empty ZSet.
+//
+// Read-only commands can treat a missing database key as this empty set,
+// avoiding special cases for ZSCORE and ZQUERY.
+static const ZSet K_EMPTY_ZSET{};
+
+// -----------------------------------------
+// ENUMERATORS
+// -----------------------------------------
 
 enum ResponseStatus {
   RESPONSE_OK = 0,
@@ -39,19 +51,39 @@ enum ResponseStatus {
 
 // error code for TAG_ERR
 enum ErrorCodes {
-    ERR_UNKNOWN = 1,    // unknown command
-    ERR_TOO_BIG = 2,    // response too big
+  ERR_UNKNOWN = 1,    // unknown command
+  ERR_TOO_BIG = 2,    // response too big
+  ERR_BAD_TYP = 3,    // unexpected value type
+  ERR_BAD_ARG = 4,    // bad arguement
 };
 
 // data types of serialized data
 enum ResponseDataTypes{
-    TAG_NIL = 0,    // nil
-    TAG_ERR = 1,    // error code + msg
-    TAG_STR = 2,    // string
-    TAG_INT = 3,    // int64
-    TAG_DBL = 4,    // double
-    TAG_ARR = 5,    // array
+  TAG_NIL = 0,    // nil
+  TAG_ERR = 1,    // error code + msg
+  TAG_STR = 2,    // string
+  TAG_INT = 3,    // int64
+  TAG_DBL = 4,    // double
+  TAG_ARR = 5,    // array
 };
+
+// value types
+
+enum ValueTypes {
+  T_INIT = 0,
+  T_STR = 1,
+  T_ZSET = 2,
+};
+
+// -----------------------------------------
+// STRUCTS
+// -----------------------------------------
+
+// placeholder; implemented later
+static struct {
+  HMap db;
+} g_data;
+
 
 struct Conn {
   // socket file desc for this client
@@ -85,39 +117,55 @@ struct Response {
     vector<uint8_t> data;
 };
 
-// One key-value pair stored in the hash table.
+// One top-level database entry:
 //
-// HNode is embedded so the hash table can link entries
-// directly without allocating a separate node.
+//   Redis key → value
+//
+// `node` lets this Entry live inside the global hash map.
+// The actual value is either `str` or `zset`, selected by `type`.
 struct Entry {
-    HNode node;          // Hash table metadata
-    string key;     // Key
-    string val;     // Value
+  HNode node;          // Intrusive node used by the top-level hash map.
+  string key;     // Database key.
+
+  // Value type, such as T_STR or T_ZSET.
+  uint32_t type = 0;
+
+  // Only one of these is logically active, based on `type`.
+  string str;     // Used when type == T_STR.
+  ZSet zset;           // Used when type == T_ZSET.
 };
 
-#include <cstddef>
+// Temporary hash-map key used only for lookup.
+//
+// It contains an HNode because hm_lookup() works with HNode pointers,
+// plus the actual database key used by entry_eq().
+struct LookupKey {
+  HNode node;
+  string key;
+};
 
-#define container_of(ptr, type, member) \
-    reinterpret_cast<type*>( \
-        reinterpret_cast<char*>(ptr) - offsetof(type, member))
+// -----------------------------------------
+// FUNCTION DECLARATIONS
+// -----------------------------------------
+
 
 // Print a simple message.
-static void msg(const std::string& message) {
-  std::cerr << message << '\n';
+static void msg(const string& message) {
+  cerr << message << '\n';
 }
 
 // Print a message along with the current errno value.
-static void msgErrno(const std::string& message) {
-  std::cerr << "[errno: " << errno << "] " << message << '\n';
+static void msgErrno(const string& message) {
+  cerr << "[errno: " << errno << "] " << message << '\n';
 }
 
 // Print an error and terminate the program.
-static void die(const std::string& message) {
-    std::cerr << "[" << errno << "] "
-              << message << ": "
-              << std::strerror(errno) << '\n';
+static void die(const string& message) {
+  cerr << "[" << errno << "] "
+            << message << ": "
+            << strerror(errno) << '\n';
 
-    std::exit(EXIT_FAILURE);
+  exit(EXIT_FAILURE);
 }
 
 // Make a nonblocking socket
@@ -223,7 +271,7 @@ static void out_dbl(Buffer &out, double val) {
     appendBytes_dbl(out, val); // response double
 }
 // error reponse
-static void out_err(Buffer &out, uint32_t code, const std::string &msg) {
+static void out_err(Buffer &out, uint32_t code, const string &msg) {
     appendBytes_u8(out, TAG_ERR); // data type field
     appendBytes_u32(out, code); // error code field
     appendBytes_u32(out, (uint32_t)msg.size()); // msg size field
@@ -235,6 +283,72 @@ static void out_arr(Buffer &out, uint32_t n) {
     appendBytes_u32(out, n); // response array
 }
 
+// Starts a serialized array response.
+//
+// Array format:
+//   [TAG_ARR: 1 byte][element count: 4 bytes][elements...]
+//
+// The number of elements is not known yet, so reserve four zero bytes
+// and return their position. Pass that position to out_end_arr() later.
+static size_t out_begin_arr(Buffer &out) {
+  out.push_back(TAG_ARR); // array bytes field
+
+  // reserve space for element count
+  appendBytes_u32(out, 0);
+
+  // return index where the count begins
+  return out.size() - sizeof(uint32_t);
+}
+
+// Completes an array started by out_begin_arr().
+//
+// `ctx` is the position returned by out_begin_arr().
+// `n` is the number of serialized elements appended to the array.
+static void out_end_arr(Buffer &out, size_t ctx, uint32_t n) {
+  // byte before the count must be array tag
+  assert(out[ctx -1] == TAG_ARR);
+
+  // backfill the reserved 4 byte element count fill
+  memcpy(out.data() + ctx, &n, sizeof(n));
+}
+
+// Creates a database entry with the requested value type.
+//
+// The caller later fills in its key and the matching value field
+// (`str` for T_STR or `zset` for T_ZSET).
+static Entry* entry_new(uint32_t type) {
+  Entry* entry = new Entry();
+  entry->type = type;
+  return entry;
+}
+
+// Destroys a database entry.
+//
+// ZSet nodes are manually allocated, so clear the sorted set before
+// deleting the Entry itself. A string value needs no special cleanup.
+static void entry_del(Entry* entry) {
+  if (entry->type == T_ZSET) {
+    zset_clear(&entry->zset);
+  }
+
+  delete entry;
+}
+
+// Compares a stored Entry against a temporary LookupKey.
+//
+// `node` belongs to a real Entry already stored in the hash map.
+// `key` belongs to the temporary LookupKey used for this search.
+static bool entry_eq(HNode* node, HNode* key) {
+  Entry* entry = container_of(node, Entry, node);
+  LookupKey* lookup_key = container_of(key, LookupKey, node);
+
+  // Hash codes are checked by hm_lookup(); this checks the actual key
+  // bytes to handle possible hash collisions.
+  return entry->key == lookup_key->key;
+}
+
+
+
 
 // Accept a new client connection
 /*
@@ -245,20 +359,21 @@ static Conn* handleAccept(int listenFd) {
   sockaddr_in clientAddr{};
   socklen_t clientLength = sizeof(clientAddr);
 
-  int clientFd =
-      accept(listenFd,
-              reinterpret_cast<sockaddr*>(&clientAddr),
-              &clientLength);
+  int clientFd = accept(
+    listenFd,
+    reinterpret_cast<sockaddr*>(&clientAddr),
+    &clientLength
+  );
 
   if (clientFd < 0) {
-      msgErrno("accept()");
-      return nullptr;
+    msgErrno("accept()");
+    return nullptr;
   }
 
   // print client address
   uint32_t ip = clientAddr.sin_addr.s_addr;
 
-  std::cout
+  cout
     << "New client from "
     << (ip & 255) << '.'
     << ((ip >> 8) & 255) << '.'
@@ -359,119 +474,97 @@ static int32_t parseRequest(
   return 0;
 }
 
-// Equality function used by the hash table.
-//
-// The hash table only sees HNode*, so convert them back
-// to Entry* and compare the actual keys.
-static bool entry_eq(HNode *lhs, HNode *rhs) {
-    Entry *le = container_of(lhs, Entry, node);
-    Entry *re = container_of(rhs, Entry, node);
 
-    return le->key == re->key;
-}
-
-// FNV-1a style hash function.
-// Converts a string into a 64-bit hash code used to
-// choose the bucket.
-static uint64_t str_hash(const uint8_t *data, size_t len) {
-    uint32_t h = 0x811C9DC5;
-
-    for (size_t i = 0; i < len; i++) {
-        h = (h + data[i]) * 0x01000193;
-    }
-
-    return h;
-}
-
-// GET command
-// Search for the key and return its value.
+// Handles: GET <key>
 static void do_get(vector<string> &cmd, Buffer &out) {
-  // temporary entry only for lookup
-  Entry key;
-
-  // copy query key - O(1)
+  // build a temporary key for searching the top-level hash-map
+  // swap() moves the req key into key.key
+  LookupKey key;
   key.key.swap(cmd[1]);
 
-  // compute hash of the key
+  // compute the same hash used by stored Entry objects
   key.node.hcode = str_hash(
-    (uint8_t*)key.key.data(),
+    reinterpret_cast<const uint8_t*>(key.key.data()),
     key.key.size()
   );
 
-  // search hash table
-  HNode *node = hm_lookup(
-    &g_data.db,
-    &key.node,
-    &entry_eq
-  );
+  // find the top-level Entry for this key
+  HNode* node = hm_lookup(&g_data.db, &key.node, entry_eq);
 
-  if (!node) {
-    return out_nil(out);
-  }
+  // missing key returns a nil response
+  if (!node) return out_nil(out);
 
-  // convert HNode* back to Entry* for the value
-  const string &val = container_of(node, Entry, node)->val;
+  // convert HNode to Entry
+  Entry* entry = container_of(node, Entry, node);
 
-  return out_str(out, val.data(), val.size());
+  // GET only on string not sorted sets
+  if (entry->type != T_STR) return out_err(out, ERR_BAD_TYP, "not a string value");
 
+  // serialize the stored string as a TAG_STR response
+  return out_str(out, entry->str.data(), entry->str.size());
 }
 
-// SET command
-// Update existing key or insert a new one.
-static void do_set(vector<string> &cmd, Buffer &out) {   
-    // temporary entry only for lookup
-    Entry key;
+// Handles: SET <key> <value>
+static void do_set(vector<string> &cmd, Buffer &out) {
+  // build a temp lookup key for req key
+  LookupKey key;
+  key.key.swap(cmd[1]);
 
-    // O(1) key swap
-    key.key.swap(cmd[1]);
+  key.node.hcode = str_hash(
+    reinterpret_cast<const uint8_t*>(key.key.data()),
+    key.key.size()
+  );
 
-    // compute hash
-    key.node.hcode = str_hash(
-      (uint8_t*)key.key.data(),
-      key.key.size()
-    );
-    
-    // find corresponding
-    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+  // check whether key already exists
+  HNode* node = hm_lookup(&g_data.db, &key.node, entry_eq);
+  if (node) {
+    // existing key: recover its Entry object
+    Entry* entry = container_of(node, Entry, node);
 
-    if (node) {
+    // set only for string not sorted set
+    if (entry->type != T_STR) return out_err(out, ERR_BAD_TYP, "not a string value");
 
-      // Existing key → replace value.
-      container_of(node, Entry, node)
-          ->val.swap(cmd[2]);
-
-    } else {
-
-      // New key → allocate a new Entry.
-      Entry *ent = new Entry();
-
-      ent->key.swap(key.key);
-      ent->node.hcode = key.node.hcode;
-      ent->val.swap(cmd[2]);
-
-      // insert into hmap
-      hm_insert(&g_data.db, &ent->node);
+    // replace the string
+    entry->str.swap(cmd[2]);
   }
+  else {
+    // new key: allocate a string Entry and insert into database
+    Entry *entry = entry_new(T_STR);
+
+    // move key and value out of parsed command
+    entry->key.swap(key.key);
+    entry->str.swap(cmd[2]);
+
+    // store the already computed hash code in the hash code
+    entry->node.hcode = key.node.hcode;
+
+    // add the entry to the top level database hash map
+    hm_insert(&g_data.db, &entry->node);
+  }
+
+  // SET succeeds with a nil response in this protocol
   return out_nil(out);
 }
 
-// DEL command
-// Remove key from hash table and free memory.
-
+// Handles: DEL <key>
+//
+// Removes the key regardless of whether it holds a string or sorted set.
+// Returns integer 1 when a key was removed, or 0 when it did not exist.
 static void do_del(vector<string> &cmd, Buffer &out) {
-    // temporary entry only for lookup
-    Entry key;
+    // temporary LookupKey only for lookup
+    LookupKey key;
 
     // O(1) key swap
     key.key.swap(cmd[1]);
 
     // compute hash
     key.node.hcode = str_hash(
-      (uint8_t*)key.key.data(),
+      reinterpret_cast<uint8_t*>(key.key.data()),
       key.key.size()
     );
 
-    // delete node
+    // Remove the matching HNode from the top-level hash map.
+    // hm_delete() returns nullptr if the key was absent.
     HNode *node = hm_delete(&g_data.db, &key.node, &entry_eq);
 
     // found
@@ -479,10 +572,53 @@ static void do_del(vector<string> &cmd, Buffer &out) {
 
       // Recover Entry* from HNode*
       // and delete it.
-      delete container_of(node, Entry, node);
+      entry_del(container_of(node, Entry, node));
     }
     // return 1 if node deleted
     return out_int(out, node ? 1 : 0);
+}
+
+#include <cmath>
+#include <cstdlib>
+
+// Parses the entire string as a floating-point value.
+//
+// Returns true only when:
+// - strtod() consumed every character, and
+// - the result is not NaN.
+//
+// Examples:
+//   "1.5"  -> true,  out = 1.5
+//   "abc"  -> false
+//   "1.5x" -> false
+//   "nan"  -> false
+static bool str2dbl(const string& text, double& out) {
+  char* end = nullptr;
+
+  // strtod() parses from the C-string representation.
+  out = strtod(text.c_str(), &end);
+
+  // `end` points immediately after the parsed number.
+  // It must equal the end of the original string.
+  return end == text.c_str() + text.size() && !isnan(out);
+}
+
+// Parses the entire string as a base-10 signed 64-bit integer.
+//
+// Returns true only when strtoll() consumed every character.
+//
+// Examples:
+//   "-42" -> true,  out = -42
+//   "12x" -> false
+//   "abc" -> false
+static bool str2int(const string& text, int64_t& out) {
+  char* end = nullptr;
+
+  // Parse a base-10 integer.
+  out = strtoll(text.c_str(), &end, 10);
+
+  // Require complete consumption: no trailing characters are allowed.
+  return end == text.c_str() + text.size();
 }
 
 
@@ -507,21 +643,226 @@ static bool cb_keys(HNode* node, void* arg) {
 }
 
 // Implements the `keys` command.
-static void do_keys(std::vector<std::string>&, Buffer& out) {
-    // Start a serialized array:
-    // [TAG_ARR][number of elements]
-    //
-    // The number of keys equals the current number of database entries.
-    out_arr(out, static_cast<uint32_t>(hm_size(&g_data.db)));
+static void do_keys(vector<string>&, Buffer& out) {
+  // Start a serialized array:
+  // [TAG_ARR][number of elements]
+  //
+  // The number of keys equals the current number of database entries.
+  out_arr(out, static_cast<uint32_t>(hm_size(&g_data.db)));
 
-    // Visit every database entry. For each one, cb_keys() appends its key
-    // as the next element in the array.
-    hm_foreach(&g_data.db, cb_keys, &out);
+  // Visit every database entry. For each one, cb_keys() appends its key
+  // as the next element in the array.
+  hm_foreach(&g_data.db, cb_keys, &out);
+}
+
+// Handles: ZADD <zset-key> <score> <name>
+//
+// Returns:
+// - 1 when `name` was newly added.
+// - 0 when `name` already existed and its score was updated.
+static void do_zadd(vector<string>& cmd, Buffer& out) {
+  // parse the score arguement first
+  double score = 0.0;
+  if (!str2dbl(cmd[2], score)) {
+    return out_err(out, ERR_BAD_ARG, "expect float");
+  }
+
+  // build a temporary top level database key for the req ZSet
+  LookupKey key;
+  key.key.swap(cmd[1]);
+
+  key.node.hcode = str_hash(
+    reinterpret_cast<const uint8_t*>(key.key.data()),
+    key.key.size()
+  );
+
+  // look up the database key
+  HNode* hash_node = hm_lookup(
+    &g_data.db,
+    &key.node,
+    entry_eq
+  );
+  
+  Entry* entry = nullptr;
+
+  if (!hash_node) {
+    // key doea not yet exist: create a new sorted set Entry
+    entry = entry_new(T_ZSET);
+
+    entry->key.swap(key.key);
+    entry->node.hcode = key.node.hcode;
+
+    hm_insert(&g_data.db, &entry->node);
+  }
+  else {
+    // key exists: it must already contain a sorted set
+    entry = container_of(hash_node, Entry, node);
+
+    if (entry->type != T_ZSET) return out_err(out, ERR_BAD_TYP, "expect sorted set");
+  }
+
+  const string &name = cmd[3];
+
+  bool added = zset_insert(
+    &entry->zset, name.data(), name.size(), score
+  );
+
+  return out_int(out, static_cast<int64_t>(added));
+}
+
+// Looks up a top-level database key and returns its ZSet.
+//
+// Returns:
+// - pointer to the stored ZSet, if the key holds a ZSet;
+// - pointer to K_EMPTY_ZSET, if the key does not exist;
+// - nullptr, if the key exists but holds another type, such as a string.
+//
+// The returned pointer to K_EMPTY_ZSET must never be modified.
+static ZSet* expect_zset(string& text) {
+  // build a temporary hashmap lookup key
+  LookupKey key;
+  key.key.swap(text);
+
+  key.node.hcode = str_hash(
+    reinterpret_cast<const uint8_t*>(key.key.data()),
+    key.key.size()
+  );
+
+  HNode *hash_node = hm_lookup(&g_data.db, &key.node, entry_eq);
+
+  // Redis style behavior here: missing ZSet is treated as empty
+  if (!hash_node) return const_cast<ZSet*>(&K_EMPTY_ZSET);
+
+  // return the ZSet only when the existing value has correct type
+  Entry *entry = container_of(hash_node, Entry, node);
+
+  return (entry->type == T_ZSET) ? &entry->zset : nullptr;
+}
+
+// Handles: ZSCORE <zset-key> <name>
+//
+// Returns the member's score as a double, or nil when the member/key
+// does not exist. Returns an error when the key exists but is not a ZSet.
+static void do_zscore(vector<string>& cmd, Buffer& out) {
+  // lookup the ZSet. A missing key behaves like an empty set
+  ZSet* zset = expect_zset(cmd[1]);
+
+  // nullptr means key exists but wrong value type
+  if (!zset) return out_err(out, ERR_BAD_TYP, " expect sorted set");
+
+  // lookup the member by its name through the ZSet hmap index
+  string &name = cmd[2];
+
+  ZNode* node = zset_lookup(
+    zset, name.data(), name.size()
+  );
+
+  // return the score when found; otherwise return nil
+  return node ? out_dbl(out, node->score) : out_nil(out);
+}
+
+// Handles: ZQUERY <zset-key> <score> <name> <offset> <limit>
+//
+// Finds the first member whose (score, name) tuple is >= the supplied tuple,
+// applies `offset`, and returns following members in sorted order.
+//
+// The response array is flat:
+//
+//   [name1, score1, name2, score2, ...]
+static void do_zquery(vector<string>& cmd, Buffer& out) {
+  // parse the starting score 
+  double score = 0.0;
+
+  if (!str2dbl(cmd[2], score)) return out_err(out, ERR_BAD_ARG, "expect fp member");
+
+  // `name` is the secondary part of the (score, name) search tuple.
+  const string name = cmd[3];
+
+  // parse rank offset and response-element limit
+  int64_t offset = 0;
+  int64_t limit = 0;
+
+  if (
+    !str2int(cmd[4], offset) || !str2int(cmd[5], limit)
+  ) return out_err(out, ERR_BAD_ARG, "expect int");
+
+  // lookup th zset or use the shared empty ZSet for a missing key
+  ZSet* zset = expect_zset(cmd[1]);
+
+  if (!zset) return out_err(out, ERR_BAD_TYP, "expect sorted set");
+
+  // a non-positive limit always produces an empty array
+  if (limit <= 0) return out_arr(out, 0);
+
+  // find the lower bound: first node with (score, name) >= target
+  ZNode* node = zset_seekge(
+    zset,
+    score,
+    name.data(),
+    name.size()
+  );
+
+  // move forward or backward by the req no of nodes
+  node = znode_offset(node, offset);
+  
+  // begin an array whose final element count is not known yet
+  size_t ctx = out_begin_arr(out);
+  int64_t count = 0;
+
+  // append each member as 2 array elements: name, score
+  while (node && count < limit) {
+    out_str(out, node->name, node->len);
+    out_dbl(out, node->score);
+
+    // advance to the next member in (score, name) order
+    node = znode_offset(node, 1);
+
+    // 2 serialized array elements were added
+    count += 2;
+  }
+
+  // backfill the array's element count field
+  out_end_arr(out, ctx, static_cast<uint32_t>(count));
+
+}
+
+// Handles: ZREM <zset-key> <name>
+//
+// Removes one member from a sorted set.
+//
+// Returns:
+// - 1 when the member existed and was removed.
+// - 0 when the member or sorted set did not exist.
+static void do_zrem(vector<string>& cmd, Buffer& out) {
+  // lookup a ZSet. A missing key is represented as an empty ZSet
+  ZSet* zset = expect_zset(cmd[1]);
+
+  // nullptr means the key exists but holds a different type
+  if (!zset) return out_err(out, ERR_BAD_TYP, "expect sorted set");
+
+  // find the number through the ZSet's name-based hash-map index
+  const string &name = cmd[2];
+
+  ZNode* node = zset_lookup(
+    zset, name.data(), name.size()
+  );
+
+  if (node) {
+    // Remove it from both indexes:
+    // - the name → node hash map
+    // - the (score, name) AVL tree
+    //
+    // zset_delete() also frees the ZNode memory.
+    zset_delete(zset, node);
+  }
+
+  // report whether a member was actually removed
+  return out_int(out, node ? 1 : 0);
 }
 
 // Execute one client command.
 // Supports: GET, SET and DEL.
-static void do_request(std::vector<std::string> &cmd, Buffer &out)
+static void do_request(vector<string> &cmd, Buffer &out)
 {
     // GET <key>
     if (cmd.size() == 2 && cmd[0] == "get") {
@@ -542,6 +883,27 @@ static void do_request(std::vector<std::string> &cmd, Buffer &out)
     else if (cmd.size() == 1 && cmd[0] == "keys") {
       return do_keys(cmd, out);
     }
+
+    // ZADD <zset-key> <score> <name>
+    else if (cmd.size() == 4 && cmd[0] == "zadd") {
+      return do_zadd(cmd, out);
+    }
+
+    // ZREM <zset-key> <name> 
+    else if (cmd.size() == 3 && cmd[0] == "zrem") {
+      return do_zrem(cmd, out);
+    }
+
+    // ZSCORE <zset-key> <name>
+    else if (cmd.size() == 3 && cmd[0] == "zscore") {
+      return do_zscore(cmd, out);
+    }
+
+    // ZQUERY <zset-key> <score> <name> <offset> <limit>
+    else if (cmd.size() == 6 && cmd[0] == "zquery") {
+      return do_zquery(cmd, out);
+    }
+
     // Unknown command
     else {
       out_err(out, ERR_UNKNOWN, "unknown command");
@@ -603,7 +965,7 @@ void response_end(Buffer &out, size_t header) {
   uint32_t length = static_cast<uint32_t>(body_size);
 
   // Backfill the previously reserved length field.
-  std::memcpy(out.data() + header, &length, sizeof(length));
+  memcpy(out.data() + header, &length, sizeof(length));
   
 }
 

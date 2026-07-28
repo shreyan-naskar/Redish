@@ -47,3 +47,7 @@ AVLNode* avl_fix(AVLNode* node);
 // Removes `node` from its AVL tree.
 // Returns the new root of the affected subtree/tree.
 AVLNode* avl_del(AVLNode* node);
+
+// offset into the succeeding or preceding node.
+// note: the worst-case is O(log N) regardless of how long the offset is.
+AVLNode *avl_offset(AVLNode *node, int64_t offset);
