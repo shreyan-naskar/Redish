@@ -7,6 +7,7 @@
 #include<cmath>
 #include <iostream>
 #include <vector>
+#include<ctime>
 #include<map>
 
 #include <fcntl.h>
@@ -20,6 +21,7 @@
 #include "hashtable.h"
 #include "zset.h"
 #include "common.h"
+#include "list.h"
 
 using namespace std;
 
@@ -30,6 +32,7 @@ using namespace std;
 constexpr size_t MAX_MSG_SIZE = 32 << 20;
 constexpr size_t READ_BUFFER_SIZE = 64 * 1024; // temp read buffer size
 constexpr size_t MAX_ARGUMENTS = 200000; // max command args
+constexpr uint64_t IDLE_TIMEOUT_MS = 5 * 1000; // Disconnect a client after five seconds without activity.
 
 using Buffer = vector<uint8_t>;
 
@@ -79,35 +82,52 @@ enum ValueTypes {
 // STRUCTS
 // -----------------------------------------
 
-// placeholder; implemented later
-static struct {
-  HMap db;
-} g_data;
-
-
+// State for one connected client.
+//
+// The event loop keeps one Conn object for every active socket.
 struct Conn {
-  // socket file desc for this client
-  int fd = -1;
-  /*
-   * The event loop uses these flags to decide whether to ask poll()
-   * to watch for reading or writing.
-   */
+    int fd = -1;  // Client socket file descriptor.
 
-  bool wantRead = false;
-  bool wantWrite = false;
-  bool wantClose = false;
+    // Tells the event loop what this connection currently needs.
+    bool wantRead = false;   // Wait for incoming request data.
+    bool wantWrite = false;  // Wait until pending response data can be sent.
+    bool wantClose = false;  // Close and delete this connection.
 
-  /*
-   * Bytes received from the client.
-   * The protocol parser reads requests from this buffer.
-   */
-  Buffer incoming;
+    // Network buffers.
+    Buffer incoming;  // Received bytes waiting to be parsed as requests.
+    Buffer outgoing;  // Serialized response bytes waiting to be sent.
 
-  /*
-   * Bytes waiting to be sent to client
-   */
-  Buffer outgoing;
+    // Idle-timeout tracking.
+    //
+    // Milliseconds from CLOCK_MONOTONIC when this connection was last active.
+    uint64_t last_active_ms = 0;
+
+    // Intrusive node that places this connection in the idle-timeout list.
+    // It is initialized with dlist_init(&idle_node).
+    DList idle_node;
 };
+
+
+// Global server state.
+//
+// This single object owns the database, active connections, and timer data.
+static struct {
+  // Top-level database:
+  // key → Entry (string, sorted set, etc.).
+  HMap db;
+
+  // Active client connections, indexed by file descriptor.
+  //
+  // fd2conn[fd] is either a Conn* or nullptr when that descriptor
+  // does not belong to an active client.
+  vector<Conn*> fdToConn;
+
+  // Circular intrusive list of idle connections.
+  //
+  // Each Conn contributes its `idle_node` to this list, allowing the
+  // server to find and close idle clients efficiently.
+  DList idle_list;
+} g_data;
 
 // +--------+---------+
 // | status | data... |
@@ -166,6 +186,22 @@ static void die(const string& message) {
             << strerror(errno) << '\n';
 
   exit(EXIT_FAILURE);
+}
+
+// Returns milliseconds from a monotonic clock.
+//
+// Unlike wall-clock time, CLOCK_MONOTONIC does not jump when the system
+// clock is adjusted, so it is suitable for measuring elapsed time.
+static uint64_t get_monotonic_msec() {
+  timespec time{};
+
+  // red seconds and nanoseconds from the monotonic clock
+  clock_gettime(CLOCK_MONOTONIC, &time);
+
+  // Convert both parts to milliseconds:
+  // seconds × 1000 + nanoseconds ÷ 1,000,000.
+  return static_cast<uint64_t>(time.tv_sec) * 1000
+    + static_cast<uint64_t>(time.tv_nsec) / 1'000'000;    
 }
 
 // Make a nonblocking socket
@@ -350,28 +386,27 @@ static bool entry_eq(HNode* node, HNode* key) {
 
 
 
-// Accept a new client connection
-/*
- * Called when poll() tells us that the listening socket is readable.
- * A listening socket becomes readable when a new client is waiting to connect.
- */
-static Conn* handleAccept(int listenFd) {
-  sockaddr_in clientAddr{};
-  socklen_t clientLength = sizeof(clientAddr);
+// Accepts one new client connection and adds it to the server state.
+//
+// Returns 0 on success and -1 when accept() fails.
+static int32_t handleAccept(int listenFd) {
+  // accept() fills this sctructure with the connecting client's address
+  sockaddr_in client_addr{};
+  socklen_t address_length = sizeof(client_addr);
 
   int clientFd = accept(
     listenFd,
-    reinterpret_cast<sockaddr*>(&clientAddr),
-    &clientLength
+    reinterpret_cast<sockaddr*>(&client_addr),
+    &address_length
   );
 
   if (clientFd < 0) {
-    msgErrno("accept()");
-    return nullptr;
+    msgErrno("accept() error");
+    return -1;
   }
 
   // print client address
-  uint32_t ip = clientAddr.sin_addr.s_addr;
+  uint32_t ip = client_addr.sin_addr.s_addr;
 
   cout
     << "New client from "
@@ -380,22 +415,47 @@ static Conn* handleAccept(int listenFd) {
     << ((ip >> 16) & 255) << '.'
     << (ip >> 24)
     << ':'
-    << ntohs(clientAddr.sin_port)
+    << ntohs(client_addr.sin_port)
     << '\n';
 
   // make client socket nonblocking
   setNonBlocking(clientFd);
   
   // create connection object
-  Conn* connection = new Conn;
-  connection->fd = clientFd;
+  Conn* conn = new Conn();
+  conn->fd = clientFd;
+  conn->wantRead = true;
 
-  /*
-   * Initially expect the client to send us a request.
-   */
-  connection->wantRead = true;
+  // Record its initial activity time and add it to the idle timer list.
+  conn->last_active_ms = get_monotonic_msec();
+  dlist_insert_before(&g_data.idle_list, &conn->idle_node);
 
-  return connection;
+  // Store the conn at the index matching its file descriptor.
+  if (g_data.fdToConn.size() <= static_cast<size_t>(clientFd)) {
+    g_data.fdToConn.resize(clientFd + 1);
+  }
+
+  assert(!g_data.fdToConn[clientFd]);
+  g_data.fdToConn[clientFd] = conn;
+
+  return 0;
+}
+
+// Closes and deletes one client connection.
+//
+// Removes every global reference to the connection before freeing it.
+static void conn_destroy(Conn* conn) {
+  // Release the socket.
+  (void)close(conn->fd);
+
+  // Remove the file-descriptor → Conn mapping.
+  g_data.fdToConn[conn->fd] = nullptr;
+
+  // Remove this connection from the idle timer list.
+  dlist_detach(&conn->idle_node);
+
+  // Release the connection object and its input/output buffers.
+  delete conn;
 }
 
 /*
@@ -1118,6 +1178,13 @@ static void handleRead(Conn* connection) {
     return; // try agian later -> connection not closed
   }
 
+  // handle IO error
+  if (bytesRead < 0) {
+    msgErrno("read() error");
+    connection->wantClose = true;
+    return; // want close
+  }
+
   // Client diconnected
   if (bytesRead == 0) {
     if (connection->incoming.empty()) msg("Client closed connection.");
@@ -1155,7 +1222,70 @@ static void handleRead(Conn* connection) {
   } // else wants read
 }
 
+// Returns how long poll() should wait before the oldest idle connection
+// reaches its timeout.
+//
+// Returns:
+// - -1: no idle connections, so there is no timer deadline.
+// -  0: a connection has already reached its deadline.
+// - >0: milliseconds until the next idle deadline.
+static int32_t next_timer_ms() {
+  // no connections means no idle timeout to schedule
+  if (dlist_empty(&g_data.idle_list)) return -1;
+
+  uint64_t now_ms = get_monotonic_msec();
+
+  // The node immediately after the sentinel is the oldest connection
+  // in the idle list, so it expires first.
+  Conn* conn = container_of(
+    g_data.idle_list.next,
+    Conn,
+    idle_node
+  );
+
+  uint64_t deadline_ms = conn->last_active_ms + IDLE_TIMEOUT_MS;
+
+  // deadline passed, poll shuold not wait
+  if (deadline_ms <= now_ms) return 0;
+
+  // safe here as timout is only 5 secs
+  return static_cast<int32_t>(deadline_ms - now_ms);
+}
+
+// Removes every idle connection whose timeout has expired.
+//
+// Call this after poll() wakes up, especially when its timeout expires.
+static void process_timers() {
+  uint64_t now_ms = get_monotonic_msec();
+
+  // The idle list is ordered from oldest to newest connection.
+  // Stop at the first non-expired connection.
+  while (!dlist_empty(&g_data.idle_list)) {
+    Conn* conn = container_of(
+      g_data.idle_list.next,
+      Conn,
+      idle_node
+    );
+
+    uint64_t  deadline_ms = conn->last_active_ms + IDLE_TIMEOUT_MS;
+    
+    if (deadline_ms >= now_ms) break; // The oldest remaining connection is not expired.
+
+    cerr << "removing idle connection: "
+          << conn->fd
+          << '\n';
+
+    // Removes it from fd2conn and idle_list, closes its socket,
+    // then deletes the Conn object.
+    conn_destroy(conn);
+  }
+}
+
 int main() {
+
+  // initialization
+  dlist_init(&g_data.idle_list);
+
   // Create listening socket
 
   int listenFd = socket(AF_INET, SOCK_STREAM, 0);
@@ -1195,12 +1325,6 @@ int main() {
   if (listen(listenFd, SOMAXCONN) < 0) // max SOMAXXCONN number of clients in queue
       die("listen()");
 
-  // Store every active client connection.
-  //
-  // Index = file descriptor
-  // Value = Conn*
-  vector<Conn*> fdToConnection; // record fd belongs to which client
-
   // poll needs an array describing every fd we want to monitor
   vector<pollfd> pollArgs;
 
@@ -1224,7 +1348,7 @@ int main() {
     });
 
     // add every connected client
-    for (Conn* connection : fdToConnection) {
+    for (Conn* connection : g_data.fdToConn) {
       // indexed by fd value -> not continuous -> many values in b/w are nullptr
       if (!connection) continue;
 
@@ -1260,10 +1384,12 @@ int main() {
     }
 
     // sleep until something happens
+    // wait for readiness
+    int32_t timeout_ms = next_timer_ms();
     int readyCount = poll(
       pollArgs.data(),
       pollArgs.size(),
-      -1 // TIMEOUT: block until an event occurs
+      timeout_ms // TIMEOUT
     );
     // system interrupt -> restart
     if (readyCount < 0 && errno == EINTR) continue;
@@ -1274,19 +1400,7 @@ int main() {
     // -> connect front of queue
     // listening socket
     if (pollArgs[0].revents) { // if POLLIN: -> client to connect
-      Conn* connection = handleAccept(listenFd); // create connection object
-
-      if (connection) {
-        
-        // ensure vector is large enough
-        if (fdToConnection.size() <= static_cast<size_t>(connection->fd)) {
-          // resize to fd value
-          fdToConnection.resize(connection->fd + 1);
-        }
-        // map fd value -> connection object
-        assert(!fdToConnection[connection->fd]);
-        fdToConnection[connection->fd] = connection;
-      }
+      handleAccept(listenFd);
     }
 
     // client sockets
@@ -1296,8 +1410,14 @@ int main() {
       // not ready
       if (ready == 0) continue;
 
-      Conn* connection = fdToConnection[pollArgs[i].fd];
+      Conn* connection = g_data.fdToConn[pollArgs[i].fd];
 
+      // update the idle timer by moving conn to the end of the list
+      connection->last_active_ms = get_monotonic_msec();
+      dlist_detach(&connection->idle_node);
+      dlist_insert_before(&g_data.idle_list, &connection->idle_node);
+
+      // HANDLE IO
       if (ready & POLLIN) handleRead(connection); // & to check if the POLLIN bit is set
 
       if (ready & POLLOUT) handleWrite(connection); // & to check if the POLLOUT bit is set
@@ -1306,11 +1426,12 @@ int main() {
       if (
         (ready & POLLERR) || (connection->wantClose)
       ) {
-        close(connection->fd);
-        fdToConnection[connection->fd] = nullptr;
-        delete connection;
+        conn_destroy(connection);
       }
     }
+
+    // handle timers
+    process_timers();
   }
   return 0;
 }
