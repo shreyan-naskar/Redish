@@ -23,6 +23,7 @@
 #include "common.h"
 #include "list.h"
 #include "heap.h"
+#include "thread_pool.h"
 
 using namespace std;
 
@@ -135,6 +136,9 @@ static struct {
   //
   // The item with the earliest expiration is at heap[0].
   vector<HeapItem> heap;
+
+  // Thread pool 
+  ThreadPool thread_pool;
 
 } g_data;
 
@@ -377,20 +381,54 @@ static Entry* entry_new(uint32_t type) {
 // the global TTL min-heap when the entry is currently scheduled.
 static void entry_set_ttl(Entry* entry, int64_t ttl_ms);
 
-// Destroys a top-level database entry.
-static void entry_del(Entry* entry) {
+// delete an entry immediately
+static void entry_del_sync(Entry* entry) {
   // A sorted set owns manually allocated ZNode objects, so clear them
   // before deleting the Entry itself.
   if (entry->type == T_ZSET) {
     zset_clear(&entry->zset);
   }
 
-  // Ensure the heap contains no timer item that still refers to this
-  // Entry. Otherwise it would contain a dangling pointer after delete.
+  // free the entry object
+  delete entry;
+}
+
+// Wrapper function for the thread pool.
+//
+// The thread pool expects a function with
+// signature: void (*)(void*)
+static void entry_del_func(void* arg) {
+  entry_del_sync(static_cast<Entry*>(arg));
+}
+
+// Destroys a top-level database entry.
+//
+// Small entries are deleted immediately.
+//
+// Large sorted sets are deleted in a worker
+// thread so the main server thread does not
+// get blocked.
+static void entry_del(Entry* entry) {
+  // remove the TTL entry from the heap
   entry_set_ttl(entry, -1);
 
-  // Destroy the Entry and its remaining C++ members, such as strings.
-  delete entry;
+  // determine the size of the container
+  size_t set_size = (entry->type == T_ZSET) ? hm_size(&entry->zset.hmap) : 0;
+
+  constexpr size_t K_LARGE_CONTAINER_SIZE = 1000;
+
+  // large container delete in worker thread
+  if (set_size > K_LARGE_CONTAINER_SIZE) {
+    thread_pool_queue(
+      &g_data.thread_pool,
+      &entry_del_func,
+      entry
+    );
+  }
+  // small container delete immediately
+  else {
+    entry_del_sync(entry);
+  }
 }
 // Compares a stored Entry against a temporary LookupKey.
 //
@@ -1494,6 +1532,7 @@ int main() {
 
   // initialization
   dlist_init(&g_data.idle_list);
+  thread_pool_init(&g_data.thread_pool, 4);
 
   // Create listening socket
 
