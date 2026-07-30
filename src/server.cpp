@@ -22,6 +22,7 @@
 #include "zset.h"
 #include "common.h"
 #include "list.h"
+#include "heap.h"
 
 using namespace std;
 
@@ -33,6 +34,8 @@ constexpr size_t MAX_MSG_SIZE = 32 << 20;
 constexpr size_t READ_BUFFER_SIZE = 64 * 1024; // temp read buffer size
 constexpr size_t MAX_ARGUMENTS = 200000; // max command args
 constexpr uint64_t IDLE_TIMEOUT_MS = 5 * 1000; // Disconnect a client after five seconds without activity.
+// Sentinel meaning: this Entry does not currently have a heap item.
+constexpr size_t NO_HEAP_INDEX = static_cast<size_t>(-1);
 
 using Buffer = vector<uint8_t>;
 
@@ -127,6 +130,12 @@ static struct {
   // Each Conn contributes its `idle_node` to this list, allowing the
   // server to find and close idle clients efficiently.
   DList idle_list;
+
+  // Binary min-heap of TTL timer items.
+  //
+  // The item with the earliest expiration is at heap[0].
+  vector<HeapItem> heap;
+
 } g_data;
 
 // +--------+---------+
@@ -152,7 +161,10 @@ struct Entry {
 
   // Only one of these is logically active, based on `type`.
   string str;     // Used when type == T_STR.
-  ZSet zset;           // Used when type == T_ZSET.
+  ZSet zset;      // Used when type == T_ZSET.
+
+  // for TTL
+  size_t heap_index = 1; // array index to heap item
 };
 
 // Temporary hash-map key used only for lookup.
@@ -358,18 +370,28 @@ static Entry* entry_new(uint32_t type) {
   return entry;
 }
 
-// Destroys a database entry.
+// FORWARD DECLARATION
+// Sets or removes an Entry's TTL.
 //
-// ZSet nodes are manually allocated, so clear the sorted set before
-// deleting the Entry itself. A string value needs no special cleanup.
+// A negative TTL means “no expiration”; it removes the Entry from
+// the global TTL min-heap when the entry is currently scheduled.
+static void entry_set_ttl(Entry* entry, int64_t ttl_ms);
+
+// Destroys a top-level database entry.
 static void entry_del(Entry* entry) {
+  // A sorted set owns manually allocated ZNode objects, so clear them
+  // before deleting the Entry itself.
   if (entry->type == T_ZSET) {
     zset_clear(&entry->zset);
   }
 
+  // Ensure the heap contains no timer item that still refers to this
+  // Entry. Otherwise it would contain a dangling pointer after delete.
+  entry_set_ttl(entry, -1);
+
+  // Destroy the Entry and its remaining C++ members, such as strings.
   delete entry;
 }
-
 // Compares a stored Entry against a temporary LookupKey.
 //
 // `node` belongs to a real Entry already stored in the hash map.
@@ -637,9 +659,6 @@ static void do_del(vector<string> &cmd, Buffer &out) {
     // return 1 if node deleted
     return out_int(out, node ? 1 : 0);
 }
-
-#include <cmath>
-#include <cstdlib>
 
 // Parses the entire string as a floating-point value.
 //
@@ -920,6 +939,142 @@ static void do_zrem(vector<string>& cmd, Buffer& out) {
   return out_int(out, node ? 1 : 0);
 }
 
+// Removes the heap item at `pos`.
+//
+// Precondition: pos < heap.size().
+//
+// The caller should mark the removed item's external index (`*ref`) as
+// invalid before or after this call, if the item will no longer be tracked.
+static void heap_delete(vector<HeapItem> &heap, size_t pos) {
+  // Replace the removed position with the last heap item.
+  heap[pos] = heap.back();
+
+  // Remove the duplicate last element.
+  heap.pop_back();
+
+  // If the replacement was not already the last item, restore heap order.
+  if (pos < heap.size()) {
+    heap_update(heap.data(), pos, heap.size());
+  }
+}
+
+// Adds a heap item or replaces an existing one.
+//
+// `pos` is the existing item's index. When pos >= heap.size(), `item` is
+// appended as a new heap item.
+static void heap_upsert(
+  std::vector<HeapItem>& heap,
+  size_t pos,
+  HeapItem item
+) {
+  if (pos < heap.size()) {
+    // Replace an existing timer item.
+    heap[pos] = item;
+  }
+  else {
+    // Append a new timer item at the end.
+    pos = heap.size();
+    heap.push_back(item);
+  }
+
+  // The value may have increased or decreased, so choose upward or
+  // downward repair as needed.
+  heap_update(heap.data(), pos, heap.size());
+}
+
+// Adds, updates, or removes an Entry's TTL.
+//
+// A HeapItem stores a pointer to `entry->heap_idx`, so heap reordering
+// automatically keeps the Entry's recorded heap position correct.
+static void entry_set_ttl(Entry* entry, int64_t ttl_ms) {
+  // a negative TTL removes an existing expiration timer
+  if (ttl_ms < 0 && entry->heap_index != NO_HEAP_INDEX) {
+    heap_delete(g_data.heap, entry->heap_index);
+
+    // this entry is no longer represented in the TTL heap
+    entry->heap_index = NO_HEAP_INDEX;
+  }
+  // a non negative TTL creates or updates the expiration timer
+  else if (ttl_ms >= 0) {
+    // store an abosolute expiration time, by monotonicc clock
+    uint64_t expire_at = get_monotonic_msec() + static_cast<uint64_t>(ttl_ms);
+
+    HeapItem item{expire_at, &entry->heap_index};
+
+    // entry->heap_index either selects its current heap item or is the
+    // sentinel value, which causes heap_upsert() to append a new item
+    heap_upsert(g_data.heap, entry->heap_index, item);
+  }
+}
+
+// Handles: PEXPIRE <key> <ttl-ms>
+//
+// Returns 1 when the key exists and its TTL was changed; otherwise 0.
+static void do_expire(vector<string> &cmd, Buffer&out) {
+  // parse the TTL in ms
+  int64_t ttl_ms = 0;
+
+  if (!str2int(cmd[2], ttl_ms)) return out_err(out, ERR_BAD_ARG, "expected int TTL");
+
+  // build a temp lookup key for the top level db hash map
+  LookupKey key;
+  key.key.swap(cmd[1]);
+
+  key.node.hcode = str_hash(
+    reinterpret_cast<const uint8_t*>(key.key.data()),
+    key.key.size()
+  );
+
+  HNode* node = hm_lookup(&g_data.db, &key.node, entry_eq);
+  if (node) {
+    Entry* entry = container_of(node, Entry, node);
+
+    // add, update or remove entry's TTL timer
+    entry_set_ttl(entry, ttl_ms);
+  }
+
+  return out_int(out, node ? 1 : 0);
+}
+
+// Handles: PTTL <key>
+//
+// Returns:
+// - remaining TTL in milliseconds, when the key has a TTL;
+// - -1 when the key exists but has no TTL;
+// - -2 when the key does not exist.
+static void do_ttl(vector<string> &cmd, Buffer &out) {
+  // build a temp lookup key
+  LookupKey key;
+  key.key.swap(cmd[1]);
+
+  key.node.hcode = str_hash(
+    reinterpret_cast<const uint8_t*>(key.key.data()),
+    key.key.size()
+  );
+
+  HNode* node = hm_lookup(&g_data.db, &key.node, entry_eq);
+
+  if (!node) return out_int(out, -2);
+
+  Entry* entry = container_of(node, Entry, node);
+
+  // this entry is not scheduled in the TTL heap
+  if (entry->heap_index == NO_HEAP_INDEX) return out_int(out, -1);
+
+  // read the absolute expiration deadline from the heap
+  int64_t expire_at = g_data.heap[entry->heap_index].val;
+  uint64_t now_ms = get_monotonic_msec();
+
+  // do not return a negative remaining time. Expired key will be
+  // deleted by timer processing; until then, return 0;
+  return out_int(
+    out, 
+    expire_at > now_ms
+    ? static_cast<int64_t>(expire_at - now_ms)
+    : 0
+  );
+}
+
 // Execute one client command.
 // Supports: GET, SET and DEL.
 static void do_request(vector<string> &cmd, Buffer &out)
@@ -937,6 +1092,16 @@ static void do_request(vector<string> &cmd, Buffer &out)
     // DEL <key>
     else if (cmd.size() == 2 && cmd[0] == "del") {
       return do_del(cmd, out);
+    }
+
+    // PEXPIRE <key> <ttl-ms>
+    else if (cmd.size() == 3 && cmd[0] == "pexpire") {
+      return do_expire(cmd, out);
+    }
+
+    // PTTL <key>
+    else if (cmd.size() == 2 && cmd[0] == "pttl") {
+      return do_ttl(cmd, out);
     }
 
     // KEYS
@@ -982,7 +1147,7 @@ static void do_request(vector<string> &cmd, Buffer &out)
 //   out.size() - header     = header + body total size
 //   out.size() - header - 4 = body size only
 static size_t response_size(Buffer &out, size_t header) {
-    return out.size() - header - 4;
+  return out.size() - header - 4;
 }
 
 // Starts one framed response message in `out`.
@@ -1230,27 +1395,48 @@ static void handleRead(Conn* connection) {
 // -  0: a connection has already reached its deadline.
 // - >0: milliseconds until the next idle deadline.
 static int32_t next_timer_ms() {
-  // no connections means no idle timeout to schedule
-  if (dlist_empty(&g_data.idle_list)) return -1;
 
   uint64_t now_ms = get_monotonic_msec();
+  uint64_t next_ms = UINT64_MAX; // earliest timer found so far
 
-  // The node immediately after the sentinel is the oldest connection
-  // in the idle list, so it expires first.
-  Conn* conn = container_of(
-    g_data.idle_list.next,
-    Conn,
-    idle_node
-  );
+  /*
+   * The idle list is sorted by
+   * last activity time.
+   *
+   * Therefore the first connection
+   * is always the one that expires first.
+   */
+  if (!dlist_empty(&g_data.idle_list)) {
+    Conn* connection = container_of(g_data.idle_list.next, Conn, idle_node);
+    next_ms = connection->last_active_ms + IDLE_TIMEOUT_MS;
+  }
 
-  uint64_t deadline_ms = conn->last_active_ms + IDLE_TIMEOUT_MS;
+  // Check TTL timers.
+  /*
+   * The heap is a min-heap.
+   *
+   * Therefore heap[0] is always the
+   * earliest expiring key.
+   */
+  if (!g_data.heap.empty() && g_data.heap[0].val < next_ms) {
+    next_ms = g_data.heap[0].val;
+  }
 
-  // deadline passed, poll shuold not wait
-  if (deadline_ms <= now_ms) return 0;
+  // No timers exist.
+  if (next_ms == UINT64_MAX) return static_cast<uint32_t>(-1);
 
-  // safe here as timout is only 5 secs
-  return static_cast<int32_t>(deadline_ms - now_ms);
+  // Timer already expired.
+  if (next_ms <= now_ms) return 0;
+
+  // Return remaining time.
+  return static_cast<uint32_t>(next_ms - now_ms);
 }
+
+// Compare two hash nodes.
+static bool hnode_same(HNode* node, HNode* key) {
+  return node == key;
+}
+
 
 // Removes every idle connection whose timeout has expired.
 //
@@ -1278,6 +1464,29 @@ static void process_timers() {
     // Removes it from fd2conn and idle_list, closes its socket,
     // then deletes the Conn object.
     conn_destroy(conn);
+  }
+
+  // remove expierd keys
+  // TTL timers using a heap
+  constexpr size_t K_MAX_WORKS = 2000;
+
+  size_t nworks = 0;
+  vector<HeapItem> &heap = g_data.heap;
+
+  while (!heap.empty() && heap[0].val < now_ms) {
+    // get entry containing this heap node
+    Entry* entry = container_of(heap[0].ref, Entry, heap_index);
+    // Remove it from the hash table.
+    HNode* node = hm_delete(&g_data.db, &entry->node, &hnode_same);
+    
+    assert(node == &entry->node);
+
+    // delete the entry itself
+    entry_del(entry);
+
+    // Prevent spending too much time
+    // deleting expired keys in one go.
+    if (nworks++ > K_MAX_WORKS) break;
   }
 }
 
