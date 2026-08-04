@@ -2,8 +2,8 @@
 #include <cstring>
 #include <cstdlib>
 // proj
-#include "zset.h"
-#include "common.h"
+#include "types/zset.h"
+#include "util/common.h"
 
 using namespace std;
 

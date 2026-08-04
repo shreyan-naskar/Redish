@@ -18,12 +18,12 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
-#include "hashtable.h"
-#include "zset.h"
-#include "common.h"
-#include "list.h"
-#include "heap.h"
-#include "thread_pool.h"
+#include "datastructures/hashtable.h"
+#include "types/zset.h"
+#include "util/common.h"
+#include "datastructures/list.h"
+#include "datastructures/heap.h"
+#include "concurrency/thread_pool.h"
 
 using namespace std;
 

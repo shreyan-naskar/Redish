@@ -1,6 +1,6 @@
 #include <assert.h>
 #include <stdlib.h>     // calloc(), free()
-#include "hashtable.h"
+#include "datastructures/hashtable.h"
 
 // open chaining for hash tables
 

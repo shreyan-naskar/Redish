@@ -1,5 +1,5 @@
 #include <cassert>
-#include "thread_pool.h"
+#include "concurrency/thread_pool.h"
 
 // Worker thread.
 //

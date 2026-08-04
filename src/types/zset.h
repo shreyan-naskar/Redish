@@ -3,8 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "avl.h"
-#include "hashtable.h"
+#include "datastructures/avl.h"
+#include "datastructures/hashtable.h"
 
 // Sorted set.
 //

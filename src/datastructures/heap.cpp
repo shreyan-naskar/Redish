@@ -1,4 +1,4 @@
-#include "heap.h"
+#include "datastructures/heap.h"
 
 // Returns the parent index of heap item `i`.
 //
